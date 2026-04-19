@@ -6,27 +6,19 @@ mod hdr;
 mod manager;
 mod wmi_monitor;
 
-/// Position used to "hide" the window while it lives in the tray.
-/// Keeping it always-visible (off-screen) is more reliable than
-/// Visible(false) on eframe 0.28 — the surface and event pump stay healthy.
-pub const OFFSCREEN_X: f32 = -32000.0;
-pub const OFFSCREEN_Y: f32 = -32000.0;
+// Shared Win32 message constants used by both app.rs and manager.rs.
+// WM_APP = 0x8000; we use WM_APP + 1 as our private message.
+pub const WM_HDR: u32 = 0x8001;
 
-fn main() -> eframe::Result<()> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("HDRify")
-            .with_inner_size([520.0, 440.0])
-            .with_min_inner_size([400.0, 300.0])
-            .with_position([OFFSCREEN_X, OFFSCREEN_Y])
-            .with_minimize_button(false)
-            .with_taskbar(false),
-        ..Default::default()
-    };
+// WPARAM values carried on WM_HDR
+pub const HDR_UPDATE:      usize = 0; // re-read shared state, refresh controls + tray
+pub const HDR_SHOW:        usize = 1; // show settings window and bring to front
+pub const HDR_HIDE:        usize = 2; // hide settings window
+pub const HDR_EXIT:        usize = 3; // clean up and quit
+pub const HDR_MENU:        usize = 4; // drain the menu event queue
+pub const HDR_TOGGLE_VIS:  usize = 5; // toggle window visibility (tray left-click)
+pub const HDR_PICKER_DONE: usize = 6; // picker window closed, refresh game list
 
-    eframe::run_native(
-        "HDRify",
-        options,
-        Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
-    )
+fn main() {
+    app::run();
 }
