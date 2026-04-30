@@ -11,6 +11,7 @@ use windows::{
     core::*,
     Win32::{
         Foundation::*,
+        Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE},
         Graphics::Gdi::*,
         System::LibraryLoader::GetModuleHandleW,
         UI::Controls::SetWindowTheme,
@@ -62,6 +63,8 @@ struct WinCtx {
     toggle_id:  MenuId,
     // HWND of the currently open process picker (null when closed)
     picker_hwnd: HWND,
+    // Track HDR state for dynamic status label coloring
+    is_hdr_active: bool,
 }
 
 // Per-window data for the process picker popup
@@ -80,8 +83,19 @@ fn to_wide(s: &str) -> Vec<u16> {
 }
 
 unsafe fn apply_gui_font(hwnd: HWND) {
-    let font = GetStockObject(DEFAULT_GUI_FONT);
-    SendMessageW(hwnd, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    let mut lf: LOGFONTW = std::mem::zeroed();
+    lf.lfHeight = -12; // ~9pt size
+    
+    // Copy "Segoe UI" into the lfFaceName array
+    let face = "Segoe UI";
+    for (i, c) in face.encode_utf16().enumerate() {
+        lf.lfFaceName[i] = c;
+    }
+    
+    let font = CreateFontIndirectW(&lf);
+    if !font.0.is_null() {
+        SendMessageW(hwnd, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    }
 }
 
 /// Create a child control and apply the system GUI font.
@@ -102,12 +116,19 @@ unsafe fn make_ctrl(
         if extra == BS_GROUPBOX_VAL || extra == BS_AUTOCHECKBOX_VAL {
             let _ = SetWindowTheme(ctrl, w!(" "), w!(" "));
         }
+        // Apply modern Explorer theme to ListBoxes
+        if class == w!("LISTBOX") {
+            let _ = SetWindowTheme(ctrl, w!("Explorer"), PCWSTR::null());
+        }
         // Make status label bold and larger
         if id == IDC_STATUS {
             let mut lf: LOGFONTW = std::mem::zeroed();
             lf.lfHeight = -14; // Larger font
             lf.lfWeight = FW_BOLD; // Bold
-            lf.lfFaceName = [b'M' as u16, b'S' as u16, b' ' as u16, b'S' as u16, b'h' as u16, b'e' as u16, b'l' as u16, b'l' as u16, b' ' as u16, b'D' as u16, b'l' as u16, b'g' as u16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            let face = "Segoe UI";
+            for (i, c) in face.encode_utf16().enumerate() {
+                lf.lfFaceName[i] = c;
+            }
             let font = CreateFontIndirectW(&lf);
             if !font.0.is_null() {
                 SendMessageW(ctrl, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
@@ -124,7 +145,10 @@ unsafe fn make_ctrl(
                 let mut lf: LOGFONTW = std::mem::zeroed();
                 lf.lfHeight = -12;
                 lf.lfWeight = FW_BOLD;
-                lf.lfFaceName = [b'M' as u16, b'S' as u16, b' ' as u16, b'S' as u16, b'h' as u16, b'e' as u16, b'l' as u16, b'l' as u16, b' ' as u16, b'D' as u16, b'l' as u16, b'g' as u16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+                let face = "Segoe UI";
+                for (i, c) in face.encode_utf16().enumerate() {
+                    lf.lfFaceName[i] = c;
+                }
                 let font = CreateFontIndirectW(&lf);
                 if !font.0.is_null() {
                     SendMessageW(ctrl, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
@@ -285,7 +309,7 @@ unsafe fn update_controls(hwnd: HWND, ctx: &mut WinCtx) {
     // Snapshot under lock; drop before any Win32 calls to avoid priority inversion.
     let (hdr_on, active, messages, games, restore) = {
         let s = ctx.shared.lock().unwrap();
-        (s.hdr_on(), s.active_count, s.messages.clone(), s.config.games.clone(), s.config.restore_on_exit)
+        (s.hdr_on(), s.active_pids.len(), s.messages.clone(), s.config.games.clone(), s.config.restore_on_exit)
     };
 
     // Status label
@@ -295,6 +319,7 @@ unsafe fn update_controls(hwnd: HWND, ctx: &mut WinCtx) {
     } else { "Idle".into() };
     let sw = to_wide(&status);
     let _ = SetWindowTextW(dlg(hwnd, IDC_STATUS), PCWSTR(sw.as_ptr()));
+    ctx.is_hdr_active = hdr_on;  // Cache the state for dynamic coloring
     InvalidateRect(dlg(hwnd, IDC_STATUS), None, true); // repaint for colour change
 
     // Toggle button text
@@ -352,6 +377,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             let cs = &*(lp.0 as *const CREATESTRUCTW);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize);
             let ctx = &mut *(cs.lpCreateParams as *mut WinCtx);
+            // Enable dark mode for title bar
+            let dark_mode: BOOL = true.into();
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                &dark_mode as *const _ as *const std::ffi::c_void,
+                std::mem::size_of_val(&dark_mode) as u32
+            );
             create_controls(hwnd, ctx.hinstance);
             update_controls(hwnd, ctx);
             LRESULT(0)
@@ -443,10 +476,26 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             LRESULT(0)
         }
 
-        // Colour static controls and groupbox text with white and transparent backgrounds
+        // Colour static controls with dynamic status label (green when HDR active, red when idle)
         WM_CTLCOLORSTATIC => {
+            let ctx = ctx!();
             let hdc = HDC(wp.0 as *mut _);
-            SetTextColor(hdc, COLORREF(0x00FFFFFF)); // Pure white
+            let ctrl_hwnd = HWND(lp.0 as *mut _); // The HWND of the control being drawn
+            
+            // Is it our Status label?
+            if ctrl_hwnd == dlg(hwnd, IDC_STATUS) {
+                if ctx.is_hdr_active {
+                    // Soft Lime Green (0x00BBGGRR)
+                    SetTextColor(hdc, COLORREF(0x0066FF66));
+                } else {
+                    // Soft Coral Red (0x00BBGGRR)
+                    SetTextColor(hdc, COLORREF(0x006666FF));
+                }
+            } else {
+                // Standard Pure White for everything else (Log, GroupBoxes, etc.)
+                SetTextColor(hdc, COLORREF(0x00FFFFFF));
+            }
+            
             SetBkColor(hdc, DARK_BG_COLOR);
             return LRESULT(DARK_BG_BRUSH.0 as isize);
         }
@@ -534,6 +583,14 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             let cs = &*(lp.0 as *const CREATESTRUCTW);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize);
             let ctx = &mut *(cs.lpCreateParams as *mut PickerCtx);
+            // Enable dark mode for title bar
+            let dark_mode: BOOL = true.into();
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                &dark_mode as *const _ as *const std::ffi::c_void,
+                std::mem::size_of_val(&dark_mode) as u32
+            );
             // Filter label + edit
             make_ctrl(hwnd, w!("STATIC"),  w!("Filter:"), 0, 10, 10, 40, 20, 0, HINSTANCE(std::ptr::null_mut()));
             let fe = make_ctrl(hwnd, w!("EDIT"), w!(""),
@@ -549,6 +606,20 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             ctx.proc_list   = pl;
             refresh_picker(ctx, "");
             LRESULT(0)
+        }
+
+        WM_CTLCOLORSTATIC => {
+            let hdc = HDC(wp.0 as *mut _);
+            SetTextColor(hdc, COLORREF(0x00FFFFFF)); // White text
+            SetBkColor(hdc, DARK_BG_COLOR);
+            return LRESULT(DARK_BG_BRUSH.0 as isize);
+        }
+
+        WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
+            let hdc = HDC(wp.0 as *mut _);
+            SetTextColor(hdc, COLORREF(0x00FFFFFF));
+            SetBkColor(hdc, DARK_PANEL_COLOR);
+            return LRESULT(DARK_PANEL_BRUSH.0 as isize);
         }
 
         WM_COMMAND => {
@@ -621,6 +692,7 @@ pub fn run() {
         open_id: open_id.clone(), exit_id: exit_id.clone(),
         restore_id:  restore_id.clone(), toggle_id: toggle_id.clone(),
         picker_hwnd: HWND(std::ptr::null_mut()),
+        is_hdr_active: false,  // Initialize to idle (red)
     });
 
     let hwnd = unsafe {

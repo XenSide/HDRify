@@ -2,6 +2,7 @@ use crate::config::{Config, GameEntry};
 use crate::hdr::{self, DisplayState};
 use crate::wmi_monitor::ProcessEvent;
 use crate::{HDR_UPDATE, WM_HDR};
+use std::collections::HashSet;
 use std::sync::{mpsc, Arc, Mutex};
 use windows::Win32::{Foundation::{HWND, LPARAM, WPARAM}, UI::WindowsAndMessaging::PostMessageW};
 
@@ -24,7 +25,7 @@ pub enum AppCmd {
 pub struct AppState {
     pub config:         Config,
     pub messages:       Vec<String>,
-    pub active_count:   usize,
+    pub active_pids:    HashSet<u32>,
     pub hdr_manually_on: bool,
     pub hdr_override_off: bool,
     pub saved_states:   Option<Vec<DisplayState>>,
@@ -32,8 +33,8 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: Config) -> Self {
-        let active_count = count_running_games(&config);
-        let (saved_states, init_msg) = if active_count > 0 {
+        let active_pids = running_game_pids(&config);
+        let (saved_states, init_msg) = if !active_pids.is_empty() {
             (Some(hdr::enable_all()), Some("HDR enabled (watched game already running).".to_string()))
         } else {
             (None, None)
@@ -41,7 +42,7 @@ impl AppState {
         AppState {
             config,
             messages: init_msg.into_iter().collect(),
-            active_count,
+            active_pids,
             hdr_manually_on: false,
             hdr_override_off: false,
             saved_states,
@@ -49,7 +50,7 @@ impl AppState {
     }
 
     pub fn hdr_on(&self) -> bool {
-        !self.hdr_override_off && (self.active_count > 0 || self.hdr_manually_on)
+        !self.hdr_override_off && (!self.active_pids.is_empty() || self.hdr_manually_on)
     }
 
     pub fn push_msg(&mut self, msg: String) {
@@ -114,7 +115,7 @@ fn do_toggle_hdr(state: &mut AppState) {
             if d.hdr_supported { hdr::set_hdr(d.adapter_id, d.target_id, false); }
         }
         state.hdr_manually_on  = false;
-        state.hdr_override_off = state.active_count > 0;
+        state.hdr_override_off = !state.active_pids.is_empty();
         state.push_msg("[-] HDR disabled manually.".into());
     } else {
         hdr::enable_all();
@@ -127,10 +128,11 @@ fn do_toggle_hdr(state: &mut AppState) {
 fn handle_process_event(ev: ProcessEvent, state: &mut AppState) {
     match ev {
         ProcessEvent::WmiError(msg) => { state.push_msg(format!("[!] {msg}")); }
-        ProcessEvent::Started(name, pre_enable_states) => {
+        ProcessEvent::Started(name, pid, pre_enable_states) => {
             if !is_watched(state, &name) { return; }
-            state.active_count += 1;
-            if state.active_count == 1 && !state.hdr_manually_on && !state.hdr_override_off {
+            let was_empty = state.active_pids.is_empty();
+            state.active_pids.insert(pid);
+            if was_empty && !state.hdr_manually_on && !state.hdr_override_off {
                 state.saved_states = pre_enable_states.or_else(|| Some(hdr::enable_all()));
                 state.push_msg(format!("[+] HDR enabled — {name} started."));
             } else if state.hdr_override_off {
@@ -139,10 +141,10 @@ fn handle_process_event(ev: ProcessEvent, state: &mut AppState) {
                 state.push_msg(format!("[+] {name} started (HDR already on)."));
             }
         }
-        ProcessEvent::Stopped(name) => {
+        ProcessEvent::Stopped(name, pid) => {
             if !is_watched(state, &name) { return; }
-            state.active_count = state.active_count.saturating_sub(1);
-            if state.active_count == 0 {
+            state.active_pids.remove(&pid);
+            if state.active_pids.is_empty() {
                 state.hdr_override_off = false;
                 if !state.hdr_manually_on {
                     if state.config.restore_on_exit {
@@ -154,7 +156,7 @@ fn handle_process_event(ev: ProcessEvent, state: &mut AppState) {
                     }
                 }
             } else {
-                state.push_msg(format!("[-] {name} exited ({} game(s) still running).", state.active_count));
+                state.push_msg(format!("[-] {name} exited ({} game(s) still running).", state.active_pids.len()));
             }
         }
     }
@@ -164,11 +166,15 @@ fn is_watched(state: &AppState, exe: &str) -> bool {
     state.config.games.iter().any(|g| g.exe_name.eq_ignore_ascii_case(exe))
 }
 
-fn count_running_games(config: &Config) -> usize {
+fn running_game_pids(config: &Config) -> HashSet<u32> {
     use sysinfo::System;
     let mut sys = System::new();
     sys.refresh_processes();
-    config.games.iter().filter(|g| {
-        sys.processes().values().any(|p| p.name().eq_ignore_ascii_case(&g.exe_name))
-    }).count()
+    let mut pids = HashSet::new();
+    for (pid, proc) in sys.processes() {
+        if config.games.iter().any(|g| g.exe_name.eq_ignore_ascii_case(proc.name())) {
+            pids.insert(pid.as_u32());
+        }
+    }
+    pids
 }

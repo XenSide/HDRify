@@ -14,8 +14,8 @@ pub enum ProcessEvent {
     /// Process started.  If HDR was enabled immediately by the monitor thread,
     /// the pre-enable display states are included so the manager can use them
     /// for later restoration.
-    Started(String, Option<Vec<DisplayState>>),
-    Stopped(String),
+    Started(String, u32, Option<Vec<DisplayState>>),
+    Stopped(String, u32),
     WmiError(String),
 }
 
@@ -26,6 +26,8 @@ pub enum ProcessEvent {
 struct Win32_ProcessStartTrace {
     #[serde(rename = "ProcessName")]
     process_name: String,
+    #[serde(rename = "ProcessID")]
+    process_id: u32,
 }
 
 #[allow(non_camel_case_types)]
@@ -33,6 +35,8 @@ struct Win32_ProcessStartTrace {
 struct Win32_ProcessStopTrace {
     #[serde(rename = "ProcessName")]
     process_name: String,
+    #[serde(rename = "ProcessID")]
+    process_id: u32,
 }
 
 pub fn spawn_monitors(tx: mpsc::Sender<ProcessEvent>, shared: Arc<Mutex<AppState>>) {
@@ -71,6 +75,7 @@ pub fn spawn_monitors(tx: mpsc::Sender<ProcessEvent>, shared: Arc<Mutex<AppState
                 match item {
                     Ok(e) => {
                         let name = e.process_name;
+                        let pid  = e.process_id;
                         // Fast path: enable HDR right here in the WMI thread,
                         // before the manager loop even wakes up.
                         let pre_enable_states = {
@@ -81,7 +86,7 @@ pub fn spawn_monitors(tx: mpsc::Sender<ProcessEvent>, shared: Arc<Mutex<AppState
                                 .iter()
                                 .any(|g| g.exe_name.eq_ignore_ascii_case(&name));
                             let should_enable = watched
-                                && state.active_count == 0
+                                && state.active_pids.is_empty()
                                 && !state.hdr_manually_on
                                 && !state.hdr_override_off;
                             drop(state); // release lock before Win32 calls
@@ -91,7 +96,7 @@ pub fn spawn_monitors(tx: mpsc::Sender<ProcessEvent>, shared: Arc<Mutex<AppState
                                 None
                             }
                         };
-                        let _ = tx_start.send(ProcessEvent::Started(name, pre_enable_states));
+                        let _ = tx_start.send(ProcessEvent::Started(name, pid, pre_enable_states));
                     }
                     Err(e) => {
                         let _ = tx_start.send(ProcessEvent::WmiError(format!(
@@ -136,7 +141,7 @@ pub fn spawn_monitors(tx: mpsc::Sender<ProcessEvent>, shared: Arc<Mutex<AppState
             for item in iter {
                 match item {
                     Ok(e) => {
-                        let _ = tx_stop.send(ProcessEvent::Stopped(e.process_name));
+                        let _ = tx_stop.send(ProcessEvent::Stopped(e.process_name, e.process_id));
                     }
                     Err(e) => {
                         let _ = tx_stop.send(ProcessEvent::WmiError(format!(

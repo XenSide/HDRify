@@ -18,7 +18,27 @@ pub const HDR_EXIT:        usize = 3; // clean up and quit
 pub const HDR_MENU:        usize = 4; // drain the menu event queue
 pub const HDR_TOGGLE_VIS:  usize = 5; // toggle window visibility (tray left-click)
 pub const HDR_PICKER_DONE: usize = 6; // picker window closed, refresh game list
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, SetPriorityClass, IDLE_PRIORITY_CLASS,
+    PROCESS_POWER_THROTTLING_STATE, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+    PROCESS_POWER_THROTTLING_EXECUTION_SPEED, SetProcessInformation, ProcessPowerThrottling
+};
 
 fn main() {
+    unsafe {
+        let process = GetCurrentProcess();
+        let _ = SetPriorityClass(process, IDLE_PRIORITY_CLASS);
+        let mut throttling = PROCESS_POWER_THROTTLING_STATE {
+            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+            StateMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        };
+        let _ = SetProcessInformation(
+            process,
+            ProcessPowerThrottling,
+            &mut throttling as *mut _ as *mut core::ffi::c_void,
+            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        );
+    }
     app::run();
 }
