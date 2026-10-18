@@ -1,3 +1,5 @@
+![HDRify](docs/cover.png)
+
 # HDRify
 
 Automatically enables HDR on all capable displays when a watched game launches, then optionally restores the previous state when it exits. Lives in the system tray with no taskbar presence.
