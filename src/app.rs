@@ -1,750 +1,812 @@
-use crate::config::GameEntry;
-use crate::manager::{AppCmd, AppEvent, AppState};
-use crate::{HDR_EXIT, HDR_HIDE, HDR_MENU, HDR_PICKER_DONE, HDR_SHOW, HDR_TOGGLE_VIS, HDR_UPDATE, WM_HDR};
-use std::collections::VecDeque;
-use std::sync::{mpsc, Arc, Mutex};
-use tray_icon::{
-    menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem},
-    TrayIcon, TrayIconBuilder, TrayIconEvent,
-};
-use windows::{
-    core::*,
-    Win32::{
-        Foundation::*,
-        Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE},
-        Graphics::Gdi::*,
-        System::LibraryLoader::GetModuleHandleW,
-        UI::Controls::SetWindowTheme,
-        UI::WindowsAndMessaging::*,
-    },
-};
+//! Settings window, tray icon, and the decisions about when HDR goes on and off.
+//! Everything in here runs on the UI thread.
 
-// Control IDs for the main settings window
-const IDC_STATUS:    i32 = 1001;
-const IDC_LOG:       i32 = 1002;
-const IDC_RESTORE:   i32 = 1003;
-const IDC_TOGGLE:    i32 = 1004;
-const IDC_GAME_LIST: i32 = 1005;
-const IDC_REMOVE:    i32 = 1006;
-const IDC_ADD_PROC:  i32 = 1007;
-const IDC_ADD_FILE:  i32 = 1008;
+use crate::config::{Config, GameEntry};
+use crate::{hdr, log, watch};
+use std::cell::{Cell, RefCell};
+use std::mem::size_of;
+use windows::core::{w, HSTRING, PCSTR, PCWSTR, PWSTR};
+use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
+use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::UI::Controls::Dialogs::*;
+use windows::Win32::UI::Controls::{CheckDlgButton, SetWindowTheme, BST_CHECKED, BST_UNCHECKED, EM_SETCUEBANNER};
+use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow, SystemParametersInfoForDpi};
+use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus, SetFocus, VK_DELETE};
+use windows::Win32::UI::Shell::*;
+use windows::Win32::UI::WindowsAndMessaging::*;
 
-const BS_GROUPBOX_VAL: u32 = 7;
+// Private window messages.
+const WM_TRAY: u32 = WM_APP + 1; // mouse events on the tray icon
+/// From the watch thread: `wParam` is a `watch::` event, `lParam` a `Box<String>`.
+pub const WM_WATCH: u32 = WM_APP + 2;
+const WM_SHOW: u32 = WM_APP + 3; // a second launch asks the running copy to show its window
 
-const DARK_BG_COLOR: COLORREF = COLORREF(0x001A1A1A);
-const DARK_PANEL_COLOR: COLORREF = COLORREF(0x002A2A2A);
+// Control and menu ids. 1 and 2 are IDOK and IDCANCEL, which Enter and Esc send.
+const ID_OK: i32 = 1;
+const ID_CANCEL: i32 = 2;
+const ID_STATUS: i32 = 100;
+const ID_TOGGLE: i32 = 101;
+const ID_RESTORE: i32 = 102;
+const ID_GAMES: i32 = 103;
+const ID_ADD_RUNNING: i32 = 104;
+const ID_BROWSE: i32 = 105;
+const ID_REMOVE: i32 = 106;
+const ID_LOG: i32 = 107;
+const ID_OPEN: i32 = 108;
+const ID_EXIT: i32 = 109;
+const ID_FILTER: i32 = 110;
+const ID_PROCESSES: i32 = 111;
+const ID_LABEL: i32 = -1; // static text nobody looks up
 
-static mut DARK_BG_BRUSH: HBRUSH = HBRUSH(0 as _);
-static mut DARK_PANEL_BRUSH: HBRUSH = HBRUSH(0 as _);
+const TIMER_RESTORE: usize = 1;
+const TIMER_TRAY: usize = 2;
 
-// Font weight constants
-const FW_BOLD: i32 = 700;
+/// Wait this long after the last game exits before putting HDR back. A game that restarts
+/// itself (through its launcher or Steam) then costs one mode switch, not three.
+const RESTORE_DELAY_MS: u32 = 5000;
+const LOG_LINES: usize = 200;
 
-// Shared queue: menu forwarder thread pushes MenuId here then posts HDR_MENU
-type MenuQueue = Arc<Mutex<VecDeque<MenuId>>>;
+// Colours are 0x00BBGGRR.
+const BG: COLORREF = COLORREF(0x00202020);
+const FIELD: COLORREF = COLORREF(0x002B2B2B);
+const TEXT: COLORREF = COLORREF(0x00FFFFFF);
+const TEXT_DIM: COLORREF = COLORREF(0x00B4B4B4);
+const GREEN: COLORREF = COLORREF(0x0080E08C);
+const AMBER: COLORREF = COLORREF(0x0050B4F0);
 
-// Per-window data stored via SetWindowLongPtrW(GWLP_USERDATA).
-// Only ever accessed from the main thread (WndProc is always called on the
-// thread that owns the window), so non-Send/Sync fields are fine here.
-struct WinCtx {
-    hinstance:   HINSTANCE,
-    shared:      Arc<Mutex<AppState>>,
-    event_tx:    mpsc::Sender<AppEvent>,
-    menu_queue:  MenuQueue,
-    // Tray items we need to update when state changes
-    tray_status:  MenuItem,
-    tray_restore: CheckMenuItem,
-    tray_toggle:  MenuItem,
-    _tray:        TrayIcon,  // keep alive
-    // Menu IDs to recognise in HDR_MENU handler
-    open_id:    MenuId,
-    exit_id:    MenuId,
-    restore_id: MenuId,
-    toggle_id:  MenuId,
-    // HWND of the currently open process picker (null when closed)
-    picker_hwnd: HWND,
-    // Track HDR state for dynamic status label coloring
-    is_hdr_active: bool,
+// ── Layout ────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy)]
+enum Font {
+    Normal,
+    Bold,
+    Big,
 }
 
-// Per-window data for the process picker popup
-struct PickerCtx {
-    main_hwnd:    HWND,
-    event_tx:     mpsc::Sender<AppEvent>,
-    all_processes: Vec<String>,
-    filter_edit:  HWND,
-    proc_list:    HWND,
+/// One child control. `rect` is x, y, width, height in 96-dpi pixels.
+struct Ctl {
+    id: i32,
+    class: PCWSTR,
+    text: PCWSTR,
+    style: u32,
+    rect: [i32; 4],
+    font: Font,
+}
+
+/// Centres static text vertically. Lives in a windows-crate module nothing else here needs.
+const SS_CENTERIMAGE: u32 = 0x200;
+const BUTTON: u32 = WS_TABSTOP.0 | BS_PUSHBUTTON as u32;
+const LIST: u32 = WS_TABSTOP.0 | WS_VSCROLL.0 | WS_BORDER.0 | (LBS_NOINTEGRALHEIGHT | LBS_NOTIFY) as u32;
+
+const MAIN_STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_OVERLAPPED.0 | WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0);
+const MAIN_SIZE: (i32, i32) = (480, 462);
+#[rustfmt::skip]
+const MAIN: &[Ctl] = &[
+    Ctl { id: ID_STATUS, class: w!("STATIC"), text: w!(""), style: SS_CENTERIMAGE, rect: [16, 14, 300, 32], font: Font::Big },
+    Ctl { id: ID_TOGGLE, class: w!("BUTTON"), text: w!("Turn HDR on"), style: BUTTON, rect: [344, 15, 120, 30], font: Font::Normal },
+    Ctl { id: ID_RESTORE, class: w!("BUTTON"), text: w!("Put HDR back the way it was when the last game exits"), style: WS_TABSTOP.0 | BS_CHECKBOX as u32, rect: [16, 56, 448, 22], font: Font::Normal },
+    Ctl { id: ID_LABEL, class: w!("STATIC"), text: w!("Games"), style: 0, rect: [16, 94, 448, 18], font: Font::Bold },
+    Ctl { id: ID_GAMES, class: w!("LISTBOX"), text: w!(""), style: LIST | LBS_WANTKEYBOARDINPUT as u32, rect: [16, 116, 448, 112], font: Font::Normal },
+    Ctl { id: ID_ADD_RUNNING, class: w!("BUTTON"), text: w!("Add a running game\u{2026}"), style: BUTTON, rect: [16, 236, 160, 30], font: Font::Normal },
+    Ctl { id: ID_BROWSE, class: w!("BUTTON"), text: w!("Browse\u{2026}"), style: BUTTON, rect: [184, 236, 96, 30], font: Font::Normal },
+    Ctl { id: ID_REMOVE, class: w!("BUTTON"), text: w!("Remove"), style: BUTTON, rect: [368, 236, 96, 30], font: Font::Normal },
+    Ctl { id: ID_LABEL, class: w!("STATIC"), text: w!("Activity"), style: 0, rect: [16, 284, 448, 18], font: Font::Bold },
+    Ctl { id: ID_LOG, class: w!("LISTBOX"), text: w!(""), style: LIST | LBS_NOSEL as u32, rect: [16, 306, 448, 140], font: Font::Normal },
+];
+
+const PICKER_STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_POPUP.0 | WS_CAPTION.0 | WS_SYSMENU.0);
+const PICKER_SIZE: (i32, i32) = (360, 440);
+#[rustfmt::skip]
+const PICKER: &[Ctl] = &[
+    Ctl { id: ID_FILTER, class: w!("EDIT"), text: w!(""), style: WS_TABSTOP.0 | WS_BORDER.0 | ES_AUTOHSCROLL as u32, rect: [16, 16, 328, 26], font: Font::Normal },
+    Ctl { id: ID_PROCESSES, class: w!("LISTBOX"), text: w!(""), style: LIST, rect: [16, 50, 328, 336], font: Font::Normal },
+    Ctl { id: ID_OK, class: w!("BUTTON"), text: w!("Add"), style: WS_TABSTOP.0 | BS_DEFPUSHBUTTON as u32, rect: [148, 396, 94, 30], font: Font::Normal },
+    Ctl { id: ID_CANCEL, class: w!("BUTTON"), text: w!("Cancel"), style: BUTTON, rect: [250, 396, 94, 30], font: Font::Normal },
+];
+
+// ── State ─────────────────────────────────────────────────────────────────
+
+/// Shared by both windows through GWLP_USERDATA. Only ever touched on the UI thread, and
+/// window procedures re-enter (a SetWindowText in one handler runs WM_CTLCOLOR in another),
+/// so every field is a Cell or a RefCell that is borrowed for one statement at a time.
+struct App {
+    hwnd: Cell<HWND>,
+    picker: Cell<HWND>,
+    config: RefCell<Config>,
+    /// Display states from before the first watched game started. `Some` from then until
+    /// the restore runs, so it also means "HDR is currently ours to put back".
+    saved: RefCell<Option<Vec<hdr::Display>>>,
+    hdr_on: Cell<bool>,
+    tray_added: Cell<bool>,
+    /// Exe names offered by the picker, before filtering.
+    processes: RefCell<Vec<String>>,
+    fonts: Cell<[HFONT; 3]>,
+    /// Tray icons: [HDR off, HDR on].
+    icons: [HICON; 2],
+    bg: HBRUSH,
+    field: HBRUSH,
+    /// Broadcast by Explorer when the taskbar (re)appears.
+    taskbar_created: u32,
+}
+
+impl App {
+    unsafe fn item(&self, id: i32) -> HWND {
+        GetDlgItem(self.hwnd.get(), id).unwrap_or_default()
+    }
+
+    unsafe fn log(&self, msg: &str) {
+        let line = HSTRING::from(log::write(msg));
+        let list = self.item(ID_LOG);
+        let count = SendMessageW(list, LB_ADDSTRING, WPARAM(0), LPARAM(line.as_ptr() as isize)).0 + 1;
+        if count as usize > LOG_LINES {
+            SendMessageW(list, LB_DELETESTRING, WPARAM(0), LPARAM(0));
+        }
+        SendMessageW(list, LB_SETTOPINDEX, WPARAM(count.max(1) as usize - 1), LPARAM(0));
+    }
+
+    fn game_names(&self) -> Vec<String> {
+        self.config.borrow().games.iter().map(|g| g.exe_name.clone()).collect()
+    }
+
+    // ── HDR ───────────────────────────────────────────────────────────────
+
+    /// Reads the real display state and shows it in the window and the tray.
+    unsafe fn refresh(&self) {
+        let displays = hdr::query();
+        let on = displays.iter().any(|d| d.enabled);
+        let capable = displays.iter().any(|d| d.supported);
+        self.hdr_on.set(on);
+
+        let mut status = String::from(match (capable, on) {
+            (false, _) => "No HDR display",
+            (true, true) => "HDR on",
+            (true, false) => "HDR off",
+        });
+        match watch::running() {
+            _ if !watch::is_tracing() => status += " \u{b7} not watching for games",
+            0 => {}
+            1 => status += " \u{b7} 1 game running",
+            n => status += &format!(" \u{b7} {n} games running"),
+        }
+        let _ = SetWindowTextW(self.item(ID_STATUS), &HSTRING::from(&status));
+        let _ = SetWindowTextW(self.item(ID_TOGGLE), if on { w!("Turn HDR off") } else { w!("Turn HDR on") });
+        let _ = EnableWindow(self.item(ID_TOGGLE), capable);
+        self.tray(&format!("HDRify \u{2014} {status}"));
+    }
+
+    /// Brings HDR in line with whether a watched game is running. Call after anything
+    /// that can change the set of running games.
+    unsafe fn sync_hdr(&self) {
+        let hwnd = self.hwnd.get();
+        if watch::running() > 0 {
+            let _ = KillTimer(hwnd, TIMER_RESTORE);
+            if self.saved.borrow().is_none() {
+                let before = hdr::query();
+                let changed = hdr::set_all(&before, true);
+                self.log(&if changed > 0 {
+                    format!("HDR turned on ({changed} display{})", if changed == 1 { "" } else { "s" })
+                } else if before.iter().any(|d| d.enabled) {
+                    "HDR was already on".into()
+                } else {
+                    "[!] Could not turn HDR on: no display accepted it".into()
+                });
+                *self.saved.borrow_mut() = Some(before);
+            }
+        } else if self.saved.borrow().is_some() {
+            SetTimer(hwnd, TIMER_RESTORE, RESTORE_DELAY_MS, None);
+        }
+        self.refresh();
+    }
+
+    /// The last game has been gone for RESTORE_DELAY_MS.
+    unsafe fn restore(&self) {
+        let _ = KillTimer(self.hwnd.get(), TIMER_RESTORE);
+        if watch::running() > 0 {
+            return;
+        }
+        let saved = self.saved.borrow_mut().take();
+        if let Some(saved) = saved {
+            if !self.config.borrow().restore_on_exit {
+                self.log("Left HDR as it is (restore is switched off)");
+            } else if hdr::restore(&saved) > 0 {
+                self.log("HDR put back the way it was before the game");
+            } else {
+                self.log("HDR is already the way it was before the game");
+            }
+        }
+        self.refresh();
+    }
+
+    unsafe fn toggle_hdr(&self) {
+        let displays = hdr::query();
+        let on = !displays.iter().any(|d| d.enabled);
+        let state = if on { "on" } else { "off" };
+        if hdr::set_all(&displays, on) > 0 {
+            self.log(&format!("HDR turned {state} by hand"));
+        } else {
+            self.log(&format!("[!] Could not turn HDR {state}"));
+        }
+        self.refresh();
+    }
+
+    // ── Games ─────────────────────────────────────────────────────────────
+
+    unsafe fn add_game(&self, exe: &str) {
+        let exe = exe.trim();
+        if exe.is_empty() {
+            return;
+        }
+        let index = {
+            let mut config = self.config.borrow_mut();
+            let found = config.games.iter().position(|g| g.exe_name.eq_ignore_ascii_case(exe));
+            found.unwrap_or_else(|| {
+                let display_name = exe.strip_suffix(".exe").unwrap_or(exe).to_string();
+                config.games.push(GameEntry { display_name, exe_name: exe.to_string() });
+                config.games.len() - 1
+            })
+        };
+        self.games_changed(Some(index));
+    }
+
+    unsafe fn remove_selected_game(&self) {
+        let index = SendMessageW(self.item(ID_GAMES), LB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
+        if index < 0 || index as usize >= self.config.borrow().games.len() {
+            return;
+        }
+        self.config.borrow_mut().games.remove(index as usize);
+        let left = self.config.borrow().games.len();
+        self.games_changed(left.checked_sub(1).map(|last| last.min(index as usize)));
+    }
+
+    /// The watch list was edited: save it, tell the watcher, redraw the list.
+    unsafe fn games_changed(&self, select: Option<usize>) {
+        self.save();
+        for name in watch::set_watch(self.game_names()) {
+            self.log(&format!("{name} is already running"));
+        }
+        self.fill_games(select);
+        self.sync_hdr();
+    }
+
+    unsafe fn save(&self) {
+        let result = self.config.borrow().save();
+        if let Err(e) = result {
+            self.log(&format!("[!] Could not save settings: {e}"));
+        }
+    }
+
+    unsafe fn fill_games(&self, select: Option<usize>) {
+        let list = self.item(ID_GAMES);
+        SendMessageW(list, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
+        for name in self.game_names() {
+            SendMessageW(list, LB_ADDSTRING, WPARAM(0), LPARAM(HSTRING::from(name).as_ptr() as isize));
+        }
+        if let Some(index) = select {
+            SendMessageW(list, LB_SETCURSEL, WPARAM(index), LPARAM(0));
+        }
+        let _ = EnableWindow(self.item(ID_REMOVE), select.is_some());
+    }
+
+    // ── Tray ──────────────────────────────────────────────────────────────
+
+    unsafe fn tray_data(&self, tip: &str) -> NOTIFYICONDATAW {
+        let mut data = NOTIFYICONDATAW {
+            cbSize: size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: self.hwnd.get(),
+            uID: 1,
+            uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
+            uCallbackMessage: WM_TRAY,
+            hIcon: self.icons[self.hdr_on.get() as usize],
+            ..Default::default()
+        };
+        for (to, from) in data.szTip.iter_mut().zip(tip.encode_utf16().take(127)) {
+            *to = from;
+        }
+        data
+    }
+
+    /// Adds or updates the tray icon. Adding fails while the taskbar doesn't exist (HDRify
+    /// starts at logon, often before Explorer), so a timer retries until it works.
+    unsafe fn tray(&self, tip: &str) {
+        let action = if self.tray_added.get() { NIM_MODIFY } else { NIM_ADD };
+        let ok = Shell_NotifyIconW(action, &self.tray_data(tip)).as_bool();
+        self.tray_added.set(ok);
+        if ok {
+            let _ = KillTimer(self.hwnd.get(), TIMER_TRAY);
+        } else {
+            SetTimer(self.hwnd.get(), TIMER_TRAY, 2000, None);
+        }
+    }
+
+    unsafe fn tray_menu(&self) {
+        let hwnd = self.hwnd.get();
+        let Ok(menu) = CreatePopupMenu() else { return };
+        let toggle = if self.hdr_on.get() { w!("Turn HDR off") } else { w!("Turn HDR on") };
+        let restore = if self.config.borrow().restore_on_exit { MF_CHECKED } else { MF_UNCHECKED };
+        let _ = AppendMenuW(menu, MF_STRING, ID_TOGGLE as usize, toggle);
+        let _ = AppendMenuW(menu, MF_STRING | restore, ID_RESTORE as usize, w!("Put HDR back when games exit"));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        let _ = AppendMenuW(menu, MF_STRING, ID_OPEN as usize, w!("Settings"));
+        let _ = AppendMenuW(menu, MF_STRING, ID_EXIT as usize, w!("Exit"));
+        let _ = SetMenuDefaultItem(menu, ID_OPEN as u32, 0);
+        let mut at = POINT::default();
+        let _ = GetCursorPos(&mut at);
+        // Without this the menu stays open when the user clicks somewhere else.
+        let _ = SetForegroundWindow(hwnd);
+        let chosen = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, at.x, at.y, 0, hwnd, None);
+        let _ = DestroyMenu(menu);
+        if chosen.0 != 0 {
+            self.command(chosen.0, BN_CLICKED);
+        }
+    }
+
+    // ── Window ────────────────────────────────────────────────────────────
+
+    unsafe fn show(&self) {
+        let hwnd = self.hwnd.get();
+        let _ = ShowWindow(hwnd, if IsIconic(hwnd).as_bool() { SW_RESTORE } else { SW_SHOW });
+        let _ = SetForegroundWindow(hwnd);
+        if GetFocus() == HWND::default() {
+            let _ = SetFocus(self.item(ID_GAMES)); // somewhere for the keyboard to start
+        }
+        self.refresh();
+    }
+
+    unsafe fn command(&self, id: i32, code: u32) {
+        let hwnd = self.hwnd.get();
+        match (id, code) {
+            (ID_TOGGLE, BN_CLICKED) => self.toggle_hdr(),
+            (ID_RESTORE, BN_CLICKED) => {
+                let on = !self.config.borrow().restore_on_exit;
+                self.config.borrow_mut().restore_on_exit = on;
+                let _ = CheckDlgButton(hwnd, ID_RESTORE, if on { BST_CHECKED } else { BST_UNCHECKED });
+                self.save();
+            }
+            (ID_ADD_RUNNING, BN_CLICKED) => self.open_picker(),
+            (ID_BROWSE, BN_CLICKED) => {
+                if let Some(exe) = browse_for_exe(hwnd) {
+                    self.add_game(&exe);
+                }
+            }
+            (ID_REMOVE, BN_CLICKED) => self.remove_selected_game(),
+            (ID_GAMES, LBN_SELCHANGE) => {
+                let _ = EnableWindow(self.item(ID_REMOVE), true);
+            }
+            (ID_OPEN, BN_CLICKED) => self.show(),
+            (ID_EXIT, BN_CLICKED) => {
+                self.shut_down();
+                let _ = DestroyWindow(hwnd);
+            }
+            (ID_CANCEL, BN_CLICKED) => {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+            _ => {}
+        }
+    }
+
+    /// Exit, logoff or shutdown: give HDR back now, there is no later.
+    unsafe fn shut_down(&self) {
+        let saved = self.saved.borrow_mut().take();
+        if let Some(saved) = saved {
+            if self.config.borrow().restore_on_exit {
+                hdr::restore(&saved);
+            }
+        }
+        let _ = Shell_NotifyIconW(NIM_DELETE, &self.tray_data(""));
+        watch::stop();
+        log::write("HDRify closed");
+    }
+
+    /// Text and background colours for every child control of both windows.
+    unsafe fn colors(&self, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+        let dc = HDC(wp.0 as *mut _);
+        let id = GetDlgCtrlID(HWND(lp.0 as *mut _));
+        let field = msg == WM_CTLCOLORLISTBOX || msg == WM_CTLCOLOREDIT;
+        SetTextColor(
+            dc,
+            match id {
+                ID_STATUS if !watch::is_tracing() => AMBER,
+                ID_STATUS if self.hdr_on.get() => GREEN,
+                ID_STATUS | ID_LOG => TEXT_DIM,
+                _ => TEXT,
+            },
+        );
+        SetBkColor(dc, if field { FIELD } else { BG });
+        LRESULT(if field { self.field } else { self.bg }.0 as isize)
+    }
+
+    /// Fonts for the monitor `hwnd` is on, in the user's system UI typeface.
+    unsafe fn make_fonts(&self, hwnd: HWND) {
+        let mut metrics = NONCLIENTMETRICSW { cbSize: size_of::<NONCLIENTMETRICSW>() as u32, ..Default::default() };
+        let _ = SystemParametersInfoForDpi(
+            SPI_GETNONCLIENTMETRICS.0,
+            metrics.cbSize,
+            Some(&mut metrics as *mut _ as *mut _),
+            0,
+            GetDpiForWindow(hwnd),
+        );
+        let mut face = metrics.lfMessageFont;
+        let normal = CreateFontIndirectW(&face);
+        face.lfWeight = 600;
+        let bold = CreateFontIndirectW(&face);
+        face.lfHeight = face.lfHeight * 3 / 2;
+        let big = CreateFontIndirectW(&face);
+        for old in self.fonts.replace([normal, bold, big]) {
+            let _ = DeleteObject(old);
+        }
+    }
+
+    /// Creates the controls in `controls` as children of `hwnd`.
+    unsafe fn create_controls(&self, hwnd: HWND, controls: &[Ctl]) {
+        let dark: BOOL = true.into();
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const _ as *const _, 4);
+        for c in controls {
+            let style = WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | c.style);
+            let id = HMENU(c.id as isize as *mut _);
+            if let Ok(ctl) =
+                CreateWindowExW(WINDOW_EX_STYLE(0), c.class, c.text, style, 0, 0, 0, 0, hwnd, id, None, None)
+            {
+                let theme = if c.id == ID_FILTER { w!("DarkMode_CFD") } else { w!("DarkMode_Explorer") };
+                let _ = SetWindowTheme(ctl, theme, None);
+            }
+        }
+    }
+
+    /// Positions and sizes `controls` and the window itself for the window's current dpi.
+    unsafe fn layout(&self, hwnd: HWND, controls: &[Ctl], client: (i32, i32), style: WINDOW_STYLE) {
+        let dpi = GetDpiForWindow(hwnd);
+        let px = |v: i32| v * dpi as i32 / 96;
+        let fonts = self.fonts.get();
+        let mut next = GetWindow(hwnd, GW_CHILD).unwrap_or_default();
+        for c in controls {
+            let [x, y, w, h] = c.rect;
+            let _ = SetWindowPos(next, None, px(x), px(y), px(w), px(h), SWP_NOZORDER | SWP_NOACTIVATE);
+            SendMessageW(next, WM_SETFONT, WPARAM(fonts[c.font as usize].0 as usize), LPARAM(1));
+            next = GetWindow(next, GW_HWNDNEXT).unwrap_or_default();
+        }
+        let mut frame = RECT { left: 0, top: 0, right: px(client.0), bottom: px(client.1) };
+        let _ = AdjustWindowRectExForDpi(&mut frame, style, false, WINDOW_EX_STYLE(0), dpi);
+        let (w, h) = (frame.right - frame.left, frame.bottom - frame.top);
+        let _ = SetWindowPos(hwnd, None, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    // ── Process picker ────────────────────────────────────────────────────
+
+    unsafe fn open_picker(&self) {
+        if IsWindow(self.picker.get()).as_bool() {
+            let _ = SetForegroundWindow(self.picker.get());
+            return;
+        }
+        let mut at = RECT::default();
+        let _ = GetWindowRect(self.hwnd.get(), &mut at);
+        let _ = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("HdrifyPicker"),
+            w!("Add a running game"),
+            PICKER_STYLE | WS_VISIBLE,
+            at.left + 48,
+            at.top + 48,
+            0,
+            0,
+            self.hwnd.get(),
+            None,
+            None,
+            Some(self as *const App as *const _),
+        );
+    }
+
+    /// Reads the running processes into the picker, minus games already on the list.
+    unsafe fn load_processes(&self) {
+        let watched = self.game_names();
+        let mut names: Vec<String> = watch::processes()
+            .into_iter()
+            .map(|(_, name)| name)
+            .filter(|n| n.to_ascii_lowercase().ends_with(".exe") && !watched.iter().any(|w| w.eq_ignore_ascii_case(n)))
+            .collect();
+        names.sort_by_key(|n| n.to_lowercase());
+        names.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        *self.processes.borrow_mut() = names;
+        self.filter_processes();
+    }
+
+    unsafe fn filter_processes(&self) {
+        let picker = self.picker.get();
+        let filter = window_text(GetDlgItem(picker, ID_FILTER).unwrap_or_default()).to_lowercase();
+        let list = GetDlgItem(picker, ID_PROCESSES).unwrap_or_default();
+        SendMessageW(list, WM_SETREDRAW, WPARAM(0), LPARAM(0));
+        SendMessageW(list, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
+        for name in self.processes.borrow().iter().filter(|n| n.to_lowercase().contains(&filter)) {
+            SendMessageW(list, LB_ADDSTRING, WPARAM(0), LPARAM(HSTRING::from(name).as_ptr() as isize));
+        }
+        SendMessageW(list, WM_SETREDRAW, WPARAM(1), LPARAM(0));
+        let _ = InvalidateRect(list, None, true);
+    }
+
+    /// Adds the picked process (or the only one left by the filter) and closes the picker.
+    unsafe fn pick_process(&self) {
+        let picker = self.picker.get();
+        let list = GetDlgItem(picker, ID_PROCESSES).unwrap_or_default();
+        let mut index = SendMessageW(list, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
+        if index < 0 && SendMessageW(list, LB_GETCOUNT, WPARAM(0), LPARAM(0)).0 == 1 {
+            index = 0;
+        }
+        let length = SendMessageW(list, LB_GETTEXTLEN, WPARAM(index as usize), LPARAM(0)).0;
+        if index < 0 || length <= 0 {
+            return;
+        }
+        let mut text = vec![0u16; length as usize + 1];
+        SendMessageW(list, LB_GETTEXT, WPARAM(index as usize), LPARAM(text.as_mut_ptr() as isize));
+        let _ = DestroyWindow(picker);
+        self.add_game(&String::from_utf16_lossy(&text[..length as usize]));
+    }
+}
+
+// ── Window procedures ─────────────────────────────────────────────────────
+
+/// The `App` a window was created with, once WM_NCCREATE has stored it.
+unsafe fn app_of(hwnd: HWND, msg: u32, lp: LPARAM) -> Option<&'static App> {
+    if msg == WM_NCCREATE {
+        let create = &*(lp.0 as *const CREATESTRUCTW);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
+    }
+    (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const App).as_ref()
+}
+
+unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let Some(app) = app_of(hwnd, msg, lp) else {
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    };
+    match msg {
+        WM_CREATE => {
+            app.hwnd.set(hwnd);
+            app.create_controls(hwnd, MAIN);
+            app.make_fonts(hwnd);
+            app.layout(hwnd, MAIN, MAIN_SIZE, MAIN_STYLE);
+            if app.config.borrow().restore_on_exit {
+                let _ = CheckDlgButton(hwnd, ID_RESTORE, BST_CHECKED);
+            }
+            app.fill_games(None);
+            app.refresh();
+        }
+        WM_COMMAND => app.command((wp.0 & 0xFFFF) as i32, (wp.0 >> 16) as u32 & 0xFFFF),
+        WM_TRAY => match lp.0 as u32 {
+            WM_LBUTTONUP if IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() => {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+            WM_LBUTTONUP => app.show(),
+            WM_RBUTTONUP => app.tray_menu(),
+            _ => {}
+        },
+        WM_WATCH => {
+            let text = *Box::from_raw(lp.0 as *mut String);
+            match wp.0 {
+                watch::STARTED => app.log(&format!("{text} started")),
+                watch::STOPPED => app.log(&format!("{text} exited")),
+                watch::READY => {
+                    for name in watch::set_watch(app.game_names()) {
+                        app.log(&format!("{name} is already running"));
+                    }
+                }
+                _ => app.log(&format!("[!] {text}")),
+            }
+            app.sync_hdr();
+        }
+        WM_SHOW => app.show(),
+        WM_TIMER if wp.0 == TIMER_RESTORE => app.restore(),
+        WM_TIMER if wp.0 == TIMER_TRAY => app.refresh(),
+        // HDR was switched by us, by Win+Alt+B or in Settings, or a monitor came or went.
+        WM_DISPLAYCHANGE => app.refresh(),
+        WM_DPICHANGED => {
+            // shortcut: an open picker keeps its old size, it is closed instead; re-lay it out if that annoys.
+            let _ = DestroyWindow(app.picker.get());
+            let to = &*(lp.0 as *const RECT);
+            let _ = SetWindowPos(hwnd, None, to.left, to.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            app.make_fonts(hwnd);
+            app.layout(hwnd, MAIN, MAIN_SIZE, MAIN_STYLE);
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN | WM_CTLCOLORLISTBOX => return app.colors(msg, wp, lp),
+        // Delete in the games list removes the selected game.
+        WM_VKEYTOITEM if (wp.0 & 0xFFFF) as u16 == VK_DELETE.0 => {
+            app.remove_selected_game();
+            return LRESULT(-2);
+        }
+        WM_VKEYTOITEM => return LRESULT(-1),
+        // The close button only hides the window; Exit is in the tray menu.
+        WM_CLOSE => {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+        WM_ENDSESSION if wp.0 != 0 => app.shut_down(),
+        WM_DESTROY => PostQuitMessage(0),
+        _ if msg == app.taskbar_created => {
+            app.tray_added.set(false);
+            app.refresh();
+        }
+        _ => return DefWindowProcW(hwnd, msg, wp, lp),
+    }
+    LRESULT(0)
+}
+
+unsafe extern "system" fn picker_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let Some(app) = app_of(hwnd, msg, lp) else {
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    };
+    match msg {
+        WM_CREATE => {
+            app.picker.set(hwnd);
+            app.create_controls(hwnd, PICKER);
+            app.layout(hwnd, PICKER, PICKER_SIZE, PICKER_STYLE);
+            let filter = GetDlgItem(hwnd, ID_FILTER).unwrap_or_default();
+            SendMessageW(filter, EM_SETCUEBANNER, WPARAM(1), LPARAM(w!("Type to filter").as_ptr() as isize));
+        }
+        // Reload on every activation: the usual flow is open this, start the game, come back.
+        WM_ACTIVATE if wp.0 & 0xFFFF != WA_INACTIVE as usize => {
+            app.load_processes();
+            let _ = SetFocus(GetDlgItem(hwnd, ID_FILTER).unwrap_or_default());
+        }
+        WM_COMMAND => match ((wp.0 & 0xFFFF) as i32, (wp.0 >> 16) as u32 & 0xFFFF) {
+            (ID_FILTER, EN_CHANGE) => app.filter_processes(),
+            (ID_PROCESSES, LBN_DBLCLK) | (ID_OK, BN_CLICKED) => app.pick_process(),
+            (ID_CANCEL, BN_CLICKED) => {
+                let _ = DestroyWindow(hwnd);
+            }
+            _ => {}
+        },
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN | WM_CTLCOLORLISTBOX | WM_CTLCOLOREDIT => return app.colors(msg, wp, lp),
+        WM_DESTROY => app.picker.set(HWND::default()),
+        _ => return DefWindowProcW(hwnd, msg, wp, lp),
+    }
+    LRESULT(0)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-fn to_wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
+unsafe fn window_text(hwnd: HWND) -> String {
+    let mut text = [0u16; 260];
+    let length = GetWindowTextW(hwnd, &mut text);
+    String::from_utf16_lossy(&text[..length as usize])
 }
 
-unsafe fn apply_gui_font(hwnd: HWND) {
-    let mut lf: LOGFONTW = std::mem::zeroed();
-    lf.lfHeight = -12; // ~9pt size
-    
-    // Copy "Segoe UI" into the lfFaceName array
-    let face = "Segoe UI";
-    for (i, c) in face.encode_utf16().enumerate() {
-        lf.lfFaceName[i] = c;
-    }
-    
-    let font = CreateFontIndirectW(&lf);
-    if !font.0.is_null() {
-        SendMessageW(hwnd, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
-    }
-}
-
-/// Create a child control and apply the system GUI font.
-unsafe fn make_ctrl(
-    parent: HWND, class: PCWSTR, text: PCWSTR,
-    extra: u32, x: i32, y: i32, w: i32, h: i32,
-    id: i32, hi: HINSTANCE,
-) -> HWND {
-    let style = WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | extra);
-    let ctrl = CreateWindowExW(
-        WINDOW_EX_STYLE(0), class, text, style,
-        x, y, w, h,
-        parent, HMENU(id as isize as *mut _), hi, None,
-    ).unwrap_or(HWND(std::ptr::null_mut()));
-    if !ctrl.0.is_null() {
-        apply_gui_font(ctrl);
-        // Disable visual styles for GroupBoxes and CheckBoxes so they respect WM_CTLCOLORSTATIC
-        if extra == BS_GROUPBOX_VAL || extra == BS_AUTOCHECKBOX_VAL {
-            let _ = SetWindowTheme(ctrl, w!(" "), w!(" "));
-        }
-        // Apply modern Explorer theme to ListBoxes
-        if class == w!("LISTBOX") {
-            let _ = SetWindowTheme(ctrl, w!("Explorer"), PCWSTR::null());
-        }
-        // Make status label bold and larger
-        if id == IDC_STATUS {
-            let mut lf: LOGFONTW = std::mem::zeroed();
-            lf.lfHeight = -14; // Larger font
-            lf.lfWeight = FW_BOLD; // Bold
-            let face = "Segoe UI";
-            for (i, c) in face.encode_utf16().enumerate() {
-                lf.lfFaceName[i] = c;
-            }
-            let font = CreateFontIndirectW(&lf);
-            if !font.0.is_null() {
-                SendMessageW(ctrl, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
-            }
-        } else {
-            // Check if this is a section header by examining the text
-            let text_str = String::from_utf16_lossy(std::slice::from_raw_parts(text.as_ptr(), {
-                let mut len = 0;
-                while *text.as_ptr().offset(len) != 0 { len += 1; }
-                len as usize
-            }));
-            if text_str == "HDR Control" || text_str == "Game Management" || text_str == "Activity Log" {
-                // Make section headers bold
-                let mut lf: LOGFONTW = std::mem::zeroed();
-                lf.lfHeight = -12;
-                lf.lfWeight = FW_BOLD;
-                let face = "Segoe UI";
-                for (i, c) in face.encode_utf16().enumerate() {
-                    lf.lfFaceName[i] = c;
-                }
-                let font = CreateFontIndirectW(&lf);
-                if !font.0.is_null() {
-                    SendMessageW(ctrl, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
-                }
-            }
-        }
-    }
-    ctrl
-}
-
-/// Get the text of the currently selected item in a listbox. Returns None if
-/// nothing is selected or the index is LB_ERR.
-// Raw control-style constants (plain i32 in windows 0.58, so no .0 accessor)
-const BST_CHECKED_VAL:   usize = 1;
-const BST_UNCHECKED_VAL: usize = 0;
-const BS_AUTOCHECKBOX_VAL: u32 = 3;
-const BS_PUSHBUTTON_VAL:   u32 = 0;
-const LBS_NOSEL_VAL:             u32 = 0x4000;
-const LBS_NOTIFY_VAL:            u32 = 0x0001;
-const LBS_NOINTEGRALHEIGHT_VAL:  u32 = 0x0100;
-const ES_AUTOHSCROLL_VAL:        u32 = 0x0080;
-
-/// Unwrapping wrapper for GetDlgItem — returns HWND::default() if not found.
-unsafe fn dlg(parent: HWND, id: i32) -> HWND {
-    GetDlgItem(parent, id).unwrap_or_default()
-}
-
-unsafe fn get_list_sel_text(list: HWND) -> Option<String> {
-    let idx = SendMessageW(list, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
-    if idx == LB_ERR as isize { return None; }
-    let len = SendMessageW(list, LB_GETTEXTLEN, WPARAM(idx as usize), LPARAM(0)).0;
-    if len <= 0 { return None; }
-    let mut buf = vec![0u16; (len + 1) as usize];
-    SendMessageW(list, LB_GETTEXT, WPARAM(idx as usize), LPARAM(buf.as_mut_ptr() as isize));
-    Some(String::from_utf16_lossy(&buf[..len as usize]))
-}
-
-// ── Tray icon ────────────────────────────────────────────────────────────
-
-fn tray_rgba() -> Vec<u8> {
-    let mut px = vec![0u8; 32 * 32 * 4];
-    for c in px.chunks_mut(4) { c[0] = 24; c[1] = 100; c[2] = 230; c[3] = 255; }
-    let mut set = |x: usize, y: usize| {
-        let i = (y * 32 + x) * 4;
-        px[i] = 255; px[i+1] = 255; px[i+2] = 255; px[i+3] = 255;
-    };
-    for y in 8..24usize { set(9,y); set(10,y); set(21,y); set(22,y); }
-    for x in 9..23usize { set(x,15); set(x,16); }
-    px
-}
-
-type TrayParts = (TrayIcon, MenuItem, CheckMenuItem, MenuItem, MenuId, MenuId, MenuId, MenuId);
-
-fn build_tray(restore_on_exit: bool) -> TrayParts {
-    let status_item  = MenuItem::new("- Idle", false, None);
-    let restore_item = CheckMenuItem::new("Restore HDR on exit", true, restore_on_exit, None);
-    let toggle_item  = MenuItem::new("Enable HDR now", true, None);
-    let open_item    = MenuItem::new("Open Settings\u{2026}", true, None);
-    let exit_item    = MenuItem::new("Exit", true, None);
-
-    let open_id    = open_item.id().clone();
-    let exit_id    = exit_item.id().clone();
-    let restore_id = restore_item.id().clone();
-    let toggle_id  = toggle_item.id().clone();
-
-    let menu = Menu::new();
-    menu.append_items(&[
-        &status_item, &PredefinedMenuItem::separator(),
-        &restore_item, &toggle_item, &PredefinedMenuItem::separator(),
-        &open_item, &exit_item,
-    ]).expect("menu append");
-
-    let icon = tray_icon::Icon::from_rgba(tray_rgba(), 32, 32).expect("tray icon");
-    let tray = TrayIconBuilder::new()
-        .with_menu(Box::new(menu))
-        .with_tooltip("HDRify")
-        .with_icon(icon)
-        .build()
-        .expect("tray build");
-
-    (tray, status_item, restore_item, toggle_item, open_id, exit_id, restore_id, toggle_id)
-}
-
-// ── Window class registration ─────────────────────────────────────────────
-
-unsafe fn register_classes(hi: HINSTANCE) {
-    let cursor = LoadCursorW(HINSTANCE(std::ptr::null_mut()), IDC_ARROW).unwrap_or_default();
-    DARK_BG_BRUSH = CreateSolidBrush(DARK_BG_COLOR);
-    DARK_PANEL_BRUSH = CreateSolidBrush(DARK_PANEL_COLOR);
-
-    let wc = WNDCLASSEXW {
-        cbSize:        std::mem::size_of::<WNDCLASSEXW>() as u32,
-        style:         CS_HREDRAW | CS_VREDRAW,
-        lpfnWndProc:   Some(wnd_proc),
-        hInstance:     hi,
-        hCursor:       cursor,
-        hbrBackground: DARK_BG_BRUSH,
-        lpszClassName: w!("HdrifyWnd"),
+/// File dialog for a game's exe. Returns the file name only: that is what gets matched.
+unsafe fn browse_for_exe(owner: HWND) -> Option<String> {
+    let mut path = [0u16; 1024];
+    let mut dialog = OPENFILENAMEW {
+        lStructSize: size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: owner,
+        lpstrFilter: w!("Programs (*.exe)\0*.exe\0"),
+        lpstrFile: PWSTR(path.as_mut_ptr()),
+        nMaxFile: path.len() as u32,
+        lpstrTitle: w!("Choose the game's exe"),
+        Flags: OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR | OFN_DONTADDTORECENT,
         ..Default::default()
     };
-    RegisterClassExW(&wc);
+    if !GetOpenFileNameW(&mut dialog).as_bool() {
+        return None;
+    }
+    let path = String::from_utf16_lossy(path.split(|&c| c == 0).next()?);
+    path.rsplit(['\\', '/']).next().map(str::to_string)
+}
 
-    let wc2 = WNDCLASSEXW {
-        cbSize:        std::mem::size_of::<WNDCLASSEXW>() as u32,
-        style:         CS_HREDRAW | CS_VREDRAW,
-        lpfnWndProc:   Some(picker_proc),
-        hInstance:     hi,
-        hCursor:       cursor,
-        hbrBackground: DARK_BG_BRUSH,
-        lpszClassName: w!("HdrifyPicker"),
-        ..Default::default()
+/// The tray and window icon: a rounded 32x32 tile with a white H, drawn here so the
+/// project carries no image files. Blue while HDR is on, grey while it is off.
+unsafe fn make_icon(tile: [u8; 3]) -> HICON {
+    let mut bgra = [0u8; 32 * 32 * 4];
+    for (i, px) in bgra.chunks_exact_mut(4).enumerate() {
+        let (x, y) = ((i % 32) as f32 + 0.5, (i / 32) as f32 + 0.5);
+        // Distance past the rounded edge (corner radius 7), turned into one pixel of anti-aliasing.
+        let (dx, dy) = ((x - 16.0).abs() - 9.0, (y - 16.0).abs() - 9.0);
+        let outside = dx.max(0.0).hypot(dy.max(0.0)) - 7.0;
+        let alpha = (0.5 - outside).clamp(0.0, 1.0);
+        let (col, row) = (i % 32, i / 32);
+        let stem = (9..=11).contains(&col) || (20..=22).contains(&col);
+        let glyph = (8..24).contains(&row) && (stem || ((15..=16).contains(&row) && (9..=22).contains(&col)));
+        let [r, g, b] = if glyph { [255, 255, 255] } else { tile };
+        px.copy_from_slice(&[b, g, r, (alpha * 255.0) as u8]);
+    }
+    let mask = [0u8; 32 * 32 / 8];
+    CreateIcon(None, 32, 32, 1, 32, mask.as_ptr(), bgra.as_ptr()).unwrap_or_default()
+}
+
+/// Makes Windows draw this app's menus, scrollbars and "DarkMode_*" themed controls dark.
+/// SetPreferredAppMode and FlushMenuThemes are undocumented uxtheme exports (ordinals 135
+/// and 136, Windows 10 1903+) that Explorer and most dark Win32 apps rely on; there is no
+/// documented way to get a dark popup menu. If they ever go away the UI is merely lighter.
+unsafe fn force_dark_mode() {
+    let Ok(uxtheme) = GetModuleHandleW(w!("uxtheme.dll")) else {
+        return;
     };
-    RegisterClassExW(&wc2);
-}
-
-// ── Controls ──────────────────────────────────────────────────────────────
-
-unsafe fn create_controls(hwnd: HWND, hi: HINSTANCE) {
-    // Status label (text set dynamically; coloured green when HDR is active)
-    make_ctrl(hwnd, w!("STATIC"), w!("Idle"), 0, 20, 20, 460, 24, IDC_STATUS, hi);
-
-    // Activity log group
-    make_ctrl(hwnd, w!("BUTTON"), w!("Activity Log"), BS_GROUPBOX_VAL, 20, 55, 460, 155, 0, hi);
-    make_ctrl(hwnd, w!("LISTBOX"), w!("") ,
-        LBS_NOSEL_VAL | LBS_NOINTEGRALHEIGHT_VAL | WS_VSCROLL.0 | WS_BORDER.0,
-        30, 75, 440, 110, IDC_LOG, hi);
-
-    // HDR Control group
-    make_ctrl(hwnd, w!("BUTTON"), w!("HDR Control"), BS_GROUPBOX_VAL, 20, 230, 460, 120, 0, hi);
-    make_ctrl(hwnd, w!("BUTTON"), w!("Restore HDR when games exit"),
-        BS_AUTOCHECKBOX_VAL, 30, 255, 320, 22, IDC_RESTORE, hi);
-    make_ctrl(hwnd, w!("BUTTON"), w!("Enable HDR Now"),
-        BS_PUSHBUTTON_VAL, 30, 290, 200, 32, IDC_TOGGLE, hi);
-
-    // Game Management group
-    make_ctrl(hwnd, w!("BUTTON"), w!("Game Management"), BS_GROUPBOX_VAL, 20, 370, 460, 145, 0, hi);
-    make_ctrl(hwnd, w!("LISTBOX"), w!("") ,
-        LBS_NOTIFY_VAL | LBS_NOINTEGRALHEIGHT_VAL | WS_VSCROLL.0 | WS_BORDER.0,
-        30, 395, 440, 100, IDC_GAME_LIST, hi);
-
-    // Action buttons — perfectly symmetrical alignment with GroupBoxes
-    // Left button (120px) aligns with the left edge of the GroupBox (x=20)
-    make_ctrl(hwnd, w!("BUTTON"), w!("Remove Selected"),
-        BS_PUSHBUTTON_VAL, 20, 525, 120, 32, IDC_REMOVE, hi);
-    // Center button (200px) sits perfectly in the middle with a 10px gap
-    make_ctrl(hwnd, w!("BUTTON"), w!("Add from Running Processes..."),
-        BS_PUSHBUTTON_VAL, 150, 525, 200, 32, IDC_ADD_PROC, hi);
-    // Right button (120px) aligns with the right edge of the GroupBox (x=480)
-    make_ctrl(hwnd, w!("BUTTON"), w!("Add from File..."),
-        BS_PUSHBUTTON_VAL, 360, 525, 120, 32, IDC_ADD_FILE, hi);
-}
-
-// ── State → UI sync ───────────────────────────────────────────────────────
-
-/// Read shared AppState and push every value to the Win32 controls and tray.
-/// Must be called from the main thread (WndProc context).
-unsafe fn update_controls(hwnd: HWND, ctx: &mut WinCtx) {
-    // Snapshot under lock; drop before any Win32 calls to avoid priority inversion.
-    let (hdr_on, active, messages, games, restore) = {
-        let s = ctx.shared.lock().unwrap();
-        (s.hdr_on(), s.active_pids.len(), s.messages.clone(), s.config.games.clone(), s.config.restore_on_exit)
-    };
-
-    // Status label
-    let status = if hdr_on {
-        if active > 0 { format!("HDR active \u{2014} {} game(s) running", active) }
-        else { "HDR active \u{2014} enabled manually".into() }
-    } else { "Idle".into() };
-    let sw = to_wide(&status);
-    let _ = SetWindowTextW(dlg(hwnd, IDC_STATUS), PCWSTR(sw.as_ptr()));
-    ctx.is_hdr_active = hdr_on;  // Cache the state for dynamic coloring
-    InvalidateRect(dlg(hwnd, IDC_STATUS), None, true); // repaint for colour change
-
-    // Toggle button text
-    let tw = to_wide(if hdr_on { "Disable HDR now" } else { "Enable HDR now" });
-    let _ = SetWindowTextW(dlg(hwnd, IDC_TOGGLE), PCWSTR(tw.as_ptr()));
-
-    // Restore checkbox
-    let chk = if restore { BST_CHECKED_VAL } else { BST_UNCHECKED_VAL };
-    SendMessageW(dlg(hwnd, IDC_RESTORE), BM_SETCHECK, WPARAM(chk), LPARAM(0));
-
-    // Log listbox: only repopulate if message count changed (avoids flicker)
-    let log = dlg(hwnd, IDC_LOG);
-    if SendMessageW(log, LB_GETCOUNT, WPARAM(0), LPARAM(0)).0 as usize != messages.len() {
-        SendMessageW(log, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
-        for m in &messages {
-            let w = to_wide(m);
-            SendMessageW(log, LB_ADDSTRING, WPARAM(0), LPARAM(w.as_ptr() as isize));
-        }
-        if !messages.is_empty() {
-            SendMessageW(log, LB_SETTOPINDEX, WPARAM(messages.len() - 1), LPARAM(0));
-        }
+    if let Some(set_preferred_app_mode) = GetProcAddress(uxtheme, PCSTR(135 as *const u8)) {
+        const FORCE_DARK: i32 = 2;
+        type Exported = unsafe extern "system" fn() -> isize;
+        type SetPreferredAppMode = unsafe extern "system" fn(i32) -> i32;
+        std::mem::transmute::<Exported, SetPreferredAppMode>(set_preferred_app_mode)(FORCE_DARK);
     }
-
-    // Game list (always repopulate; list is small)
-    let gl = dlg(hwnd, IDC_GAME_LIST);
-    SendMessageW(gl, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
-    for g in &games {
-        let t = to_wide(&format!("{} ({})", g.display_name, g.exe_name));
-        SendMessageW(gl, LB_ADDSTRING, WPARAM(0), LPARAM(t.as_ptr() as isize));
-    }
-
-    // Tray items
-    let tray_label = if hdr_on {
-        if active > 0 { format!("HDR active ({} game(s))", active) } else { "HDR active (manual)".into() }
-    } else { "- Idle".into() };
-    let _ = ctx.tray_status.set_text(&tray_label);
-    let _ = ctx.tray_toggle.set_text(if hdr_on { "Disable HDR now" } else { "Enable HDR now" });
-    ctx.tray_restore.set_checked(restore);
-}
-
-// ── Main window procedure ─────────────────────────────────────────────────
-
-unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    // Helper: borrow the per-window context. Returns None before WM_CREATE sets it.
-    macro_rules! ctx {
-        () => {{
-            let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WinCtx;
-            if p.is_null() { return DefWindowProcW(hwnd, msg, wp, lp); }
-            &mut *p
-        }};
-    }
-
-    match msg {
-        WM_CREATE => {
-            let cs = &*(lp.0 as *const CREATESTRUCTW);
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize);
-            let ctx = &mut *(cs.lpCreateParams as *mut WinCtx);
-            // Enable dark mode for title bar
-            let dark_mode: BOOL = true.into();
-            let _ = DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_USE_IMMERSIVE_DARK_MODE,
-                &dark_mode as *const _ as *const std::ffi::c_void,
-                std::mem::size_of_val(&dark_mode) as u32
-            );
-            create_controls(hwnd, ctx.hinstance);
-            update_controls(hwnd, ctx);
-            LRESULT(0)
-        }
-
-        WM_COMMAND => {
-            let ctx = ctx!();
-            let id   = (wp.0 & 0xFFFF) as i32;
-            let note = ((wp.0 >> 16) & 0xFFFF) as u32;
-            match (id, note) {
-                (IDC_TOGGLE, BN_CLICKED) => {
-                    ctx.event_tx.send(AppEvent::Cmd(AppCmd::ToggleHdr)).ok();
-                }
-                (IDC_RESTORE, BN_CLICKED) => {
-                    // BS_AUTOCHECKBOX already toggled state; read new value
-                    let v = SendMessageW(dlg(hwnd, IDC_RESTORE), BM_GETCHECK, WPARAM(0), LPARAM(0));
-                    ctx.event_tx.send(AppEvent::Cmd(AppCmd::SetRestoreOnExit(v.0 == 1))).ok();
-                }
-                (IDC_REMOVE, BN_CLICKED) => {
-                    let idx = SendMessageW(dlg(hwnd, IDC_GAME_LIST), LB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
-                    if idx != LB_ERR as isize {
-                        ctx.event_tx.send(AppEvent::Cmd(AppCmd::RemoveGame(idx as usize))).ok();
-                    }
-                }
-                (IDC_ADD_PROC, BN_CLICKED) => {
-                    if ctx.picker_hwnd.0.is_null() || !IsWindow(ctx.picker_hwnd).as_bool() {
-                        ctx.picker_hwnd = open_picker(hwnd, ctx.event_tx.clone(), ctx.hinstance);
-                    } else {
-                        SetForegroundWindow(ctx.picker_hwnd);
-                    }
-                }
-                (IDC_ADD_FILE, BN_CLICKED) => {
-                    if let Some(p) = rfd::FileDialog::new().add_filter("Executable", &["exe"])
-                        .set_title("Select Game Executable").pick_file()
-                    {
-                        let exe = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                        let display = p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| exe.clone());
-                        ctx.event_tx.send(AppEvent::Cmd(AppCmd::AddGame(GameEntry { display_name: display, exe_name: exe }))).ok();
-                    }
-                }
-                _ => {}
-            }
-            LRESULT(0)
-        }
-
-        WM_HDR => {
-            if wp.0 == HDR_TOGGLE_VIS {
-                if IsWindowVisible(hwnd).as_bool() {
-                    let _ = ShowWindow(hwnd, SW_HIDE);
-                } else {
-                    let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
-                    let _ = SetForegroundWindow(hwnd);
-                    update_controls(hwnd, ctx!());
-                }
-                return LRESULT(0);
-            }
-            let ctx = ctx!();
-            match wp.0 {
-                x if x == HDR_UPDATE => { update_controls(hwnd, ctx); }
-                x if x == HDR_SHOW   => { let _ = ShowWindow(hwnd, SW_SHOWNORMAL); let _ = SetForegroundWindow(hwnd); update_controls(hwnd, ctx); }
-                x if x == HDR_HIDE   => { let _ = ShowWindow(hwnd, SW_HIDE); }
-                x if x == HDR_PICKER_DONE => { ctx.picker_hwnd = HWND(std::ptr::null_mut()); update_controls(hwnd, ctx); }
-                x if x == HDR_EXIT => {
-                    let (restore, saved) = {
-                        let mut s = ctx.shared.lock().unwrap();
-                        let saved = if s.config.restore_on_exit { s.saved_states.take() } else { None };
-                        (s.config.restore_on_exit, saved)
-                    };
-                    if restore { if let Some(states) = saved { crate::hdr::restore(&states); } }
-                    let _ = DestroyWindow(hwnd);
-                }
-                x if x == HDR_MENU => {
-                    let ids: Vec<MenuId> = { let mut q = ctx.menu_queue.lock().unwrap(); q.drain(..).collect() };
-                    for id in ids {
-                        if id == ctx.open_id {
-                            ShowWindow(hwnd, SW_SHOWNORMAL); SetForegroundWindow(hwnd); update_controls(hwnd, ctx);
-                        } else if id == ctx.exit_id {
-                            SendMessageW(hwnd, WM_HDR, WPARAM(HDR_EXIT), LPARAM(0));
-                        } else if id == ctx.restore_id {
-                            { let mut s = ctx.shared.lock().unwrap(); s.config.restore_on_exit = !s.config.restore_on_exit; s.config.save(); }
-                            update_controls(hwnd, ctx);
-                        } else if id == ctx.toggle_id {
-                            ctx.event_tx.send(AppEvent::Cmd(AppCmd::ToggleHdr)).ok();
-                        }
-                    }
-                }
-                _ => {}
-            }
-            LRESULT(0)
-        }
-
-        // Colour static controls with dynamic status label (green when HDR active, red when idle)
-        WM_CTLCOLORSTATIC => {
-            let ctx = ctx!();
-            let hdc = HDC(wp.0 as *mut _);
-            let ctrl_hwnd = HWND(lp.0 as *mut _); // The HWND of the control being drawn
-            
-            // Is it our Status label?
-            if ctrl_hwnd == dlg(hwnd, IDC_STATUS) {
-                if ctx.is_hdr_active {
-                    // Soft Lime Green (0x00BBGGRR)
-                    SetTextColor(hdc, COLORREF(0x0066FF66));
-                } else {
-                    // Soft Coral Red (0x00BBGGRR)
-                    SetTextColor(hdc, COLORREF(0x006666FF));
-                }
-            } else {
-                // Standard Pure White for everything else (Log, GroupBoxes, etc.)
-                SetTextColor(hdc, COLORREF(0x00FFFFFF));
-            }
-            
-            SetBkColor(hdc, DARK_BG_COLOR);
-            return LRESULT(DARK_BG_BRUSH.0 as isize);
-        }
-
-        WM_CTLCOLORBTN => {
-            let hdc = HDC(wp.0 as *mut _);
-            SetTextColor(hdc, COLORREF(0x00FFFFFF)); // Pure white for groupbox and checkbox text
-            SetBkColor(hdc, DARK_BG_COLOR);
-            return LRESULT(DARK_BG_BRUSH.0 as isize);
-        }
-
-        WM_CTLCOLORLISTBOX => {
-            let hdc = HDC(wp.0 as *mut _);
-            SetTextColor(hdc, COLORREF(0x00FFFFFF)); // Pure white
-            SetBkColor(hdc, DARK_PANEL_COLOR);
-            return LRESULT(DARK_PANEL_BRUSH.0 as isize);
-        }
-
-        // X button hides instead of destroying (app lives in tray)
-        WM_CLOSE => { ShowWindow(hwnd, SW_HIDE); LRESULT(0) }
-
-        WM_NCDESTROY => {
-            let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WinCtx;
-            if !p.is_null() { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0); drop(Box::from_raw(p)); }
-            PostQuitMessage(0);
-            LRESULT(0)
-        }
-
-        _ => DefWindowProcW(hwnd, msg, wp, lp)
-    }
-}
-
-// ── Process picker popup ──────────────────────────────────────────────────
-
-unsafe fn open_picker(parent: HWND, event_tx: mpsc::Sender<AppEvent>, hi: HINSTANCE) -> HWND {
-    let ctx = Box::new(PickerCtx {
-        main_hwnd: parent,
-        event_tx,
-        all_processes: vec![],
-        filter_edit: HWND(std::ptr::null_mut()),
-        proc_list:   HWND(std::ptr::null_mut()),
-    });
-    CreateWindowExW(
-        WS_EX_TOOLWINDOW,
-        w!("HdrifyPicker"), w!("Add Game"),
-        WINDOW_STYLE(WS_CAPTION.0 | WS_SYSMENU.0 | WS_VISIBLE.0),
-        CW_USEDEFAULT, CW_USEDEFAULT, 380, 460,
-        parent, HMENU(std::ptr::null_mut()), hi,
-        Some(Box::into_raw(ctx) as *const _),
-    ).unwrap_or(HWND(std::ptr::null_mut()))
-}
-
-unsafe fn refresh_picker(ctx: &mut PickerCtx, filter: &str) {
-    use sysinfo::System;
-    ctx.all_processes.clear();
-    let mut sys = System::new();
-    sys.refresh_processes();
-    let mut names: Vec<String> = sys.processes().values().map(|p| p.name().to_string()).collect();
-    names.sort_unstable(); names.dedup();
-    ctx.all_processes = names;
-    populate_picker_list(ctx.proc_list, &ctx.all_processes, filter);
-}
-
-unsafe fn populate_picker_list(list: HWND, procs: &[String], filter: &str) {
-    SendMessageW(list, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
-    let f = filter.to_lowercase();
-    for name in procs {
-        if f.is_empty() || name.to_lowercase().contains(&f) {
-            let w = to_wide(name);
-            SendMessageW(list, LB_ADDSTRING, WPARAM(0), LPARAM(w.as_ptr() as isize));
-        }
-    }
-}
-
-unsafe extern "system" fn picker_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    macro_rules! ctx {
-        () => {{
-            let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PickerCtx;
-            if p.is_null() { return DefWindowProcW(hwnd, msg, wp, lp); }
-            &mut *p
-        }};
-    }
-    match msg {
-        WM_CREATE => {
-            let cs = &*(lp.0 as *const CREATESTRUCTW);
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize);
-            let ctx = &mut *(cs.lpCreateParams as *mut PickerCtx);
-            // Enable dark mode for title bar
-            let dark_mode: BOOL = true.into();
-            let _ = DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_USE_IMMERSIVE_DARK_MODE,
-                &dark_mode as *const _ as *const std::ffi::c_void,
-                std::mem::size_of_val(&dark_mode) as u32
-            );
-            // Filter label + edit
-            make_ctrl(hwnd, w!("STATIC"),  w!("Filter:"), 0, 10, 10, 40, 20, 0, HINSTANCE(std::ptr::null_mut()));
-            let fe = make_ctrl(hwnd, w!("EDIT"), w!(""),
-                ES_AUTOHSCROLL_VAL | WS_BORDER.0,
-                55, 8, 200, 22, 2001, HINSTANCE(std::ptr::null_mut()));
-            make_ctrl(hwnd, w!("BUTTON"), w!("Refresh"), BS_PUSHBUTTON_VAL, 262, 8, 55, 22, 2002, HINSTANCE(std::ptr::null_mut()));
-            make_ctrl(hwnd, w!("BUTTON"), w!("Close"),   BS_PUSHBUTTON_VAL, 322, 8, 46, 22, 2003, HINSTANCE(std::ptr::null_mut()));
-            // Process list
-            let pl = make_ctrl(hwnd, w!("LISTBOX"), w!(""),
-                LBS_NOTIFY_VAL | LBS_NOINTEGRALHEIGHT_VAL | WS_VSCROLL.0 | WS_BORDER.0,
-                10, 38, 352, 378, 2004, HINSTANCE(std::ptr::null_mut()));
-            ctx.filter_edit = fe;
-            ctx.proc_list   = pl;
-            refresh_picker(ctx, "");
-            LRESULT(0)
-        }
-
-        WM_CTLCOLORSTATIC => {
-            let hdc = HDC(wp.0 as *mut _);
-            SetTextColor(hdc, COLORREF(0x00FFFFFF)); // White text
-            SetBkColor(hdc, DARK_BG_COLOR);
-            return LRESULT(DARK_BG_BRUSH.0 as isize);
-        }
-
-        WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
-            let hdc = HDC(wp.0 as *mut _);
-            SetTextColor(hdc, COLORREF(0x00FFFFFF));
-            SetBkColor(hdc, DARK_PANEL_COLOR);
-            return LRESULT(DARK_PANEL_BRUSH.0 as isize);
-        }
-
-        WM_COMMAND => {
-            let ctx = ctx!();
-            let id   = (wp.0 & 0xFFFF) as i32;
-            let note = ((wp.0 >> 16) & 0xFFFF) as u32;
-
-            // Get current filter text
-            let filter_len = GetWindowTextLengthW(ctx.filter_edit);
-            let mut fbuf = vec![0u16; (filter_len + 1) as usize];
-            GetWindowTextW(ctx.filter_edit, &mut fbuf);
-            let filter = String::from_utf16_lossy(&fbuf[..filter_len as usize]);
-
-            match (id, note) {
-                (2001, EN_CHANGE) => { populate_picker_list(ctx.proc_list, &ctx.all_processes, &filter); }
-                (2002, BN_CLICKED) => { refresh_picker(ctx, &filter); }
-                (2003, BN_CLICKED) => { let _ = DestroyWindow(hwnd); }
-                (2004, v) if v == LBN_DBLCLK || (v == 0 && (wp.0 >> 16) == 0) => {
-                    if let Some(exe) = get_list_sel_text(ctx.proc_list) {
-                        let display = exe.strip_suffix(".exe").unwrap_or(&exe).to_string();
-                        ctx.event_tx.send(AppEvent::Cmd(AppCmd::AddGame(GameEntry { display_name: display, exe_name: exe }))).ok();
-                        let _ = DestroyWindow(hwnd);
-                    }
-                }
-                _ => {}
-            }
-            LRESULT(0)
-        }
-
-        WM_NCDESTROY => {
-            let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PickerCtx;
-            if !p.is_null() {
-                let main = (*p).main_hwnd;
-                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-                drop(Box::from_raw(p));
-                // Notify main window so it clears picker_hwnd and refreshes the game list
-                let _ = PostMessageW(main, WM_HDR, WPARAM(HDR_PICKER_DONE), LPARAM(0));
-            }
-            LRESULT(0)
-        }
-
-        WM_CLOSE => { let _ = DestroyWindow(hwnd); LRESULT(0) }
-        _ => DefWindowProcW(hwnd, msg, wp, lp)
+    if let Some(flush_menu_themes) = GetProcAddress(uxtheme, PCSTR(136 as *const u8)) {
+        flush_menu_themes();
     }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────
 
 pub fn run() {
-    let hm = unsafe { GetModuleHandleW(PCWSTR::null()).unwrap() };
-    let hinstance: HINSTANCE = hm.into();
-    let config    = crate::config::Config::load();
-    let restore   = config.restore_on_exit;
-    let shared    = Arc::new(Mutex::new(AppState::new(config)));
-
-    let (event_tx, event_rx) = mpsc::channel::<AppEvent>();
-    let menu_queue: MenuQueue = Arc::new(Mutex::new(VecDeque::new()));
-
-    let (tray, tray_status, tray_restore, tray_toggle, open_id, exit_id, restore_id, toggle_id) =
-        build_tray(restore);
-
-    unsafe { register_classes(hinstance); }
-
-    let win_ctx = Box::new(WinCtx {
-        hinstance,
-        shared:      Arc::clone(&shared),
-        event_tx:    event_tx.clone(),
-        menu_queue:  Arc::clone(&menu_queue),
-        tray_status, tray_restore, tray_toggle, _tray: tray,
-        open_id: open_id.clone(), exit_id: exit_id.clone(),
-        restore_id:  restore_id.clone(), toggle_id: toggle_id.clone(),
-        picker_hwnd: HWND(std::ptr::null_mut()),
-        is_hdr_active: false,  // Initialize to idle (red)
-    });
-
-    let hwnd = unsafe {
-        CreateWindowExW(
-            WS_EX_TOOLWINDOW, w!("HdrifyWnd"), w!("HDRify"),
-            WINDOW_STYLE(WS_CAPTION.0 | WS_SYSMENU.0),
-            CW_USEDEFAULT, CW_USEDEFAULT, 515, 615,
-            HWND(std::ptr::null_mut()), HMENU(std::ptr::null_mut()),
-            hinstance, Some(Box::into_raw(win_ctx) as *const _),
-        ).expect("CreateWindowExW failed")
-    };
-
-    let hwnd_val = hwnd.0 as isize;
-
-    // Manager thread: processes AppEvent::Cmd and AppEvent::Process
-    crate::manager::spawn(hwnd_val, event_rx, Arc::clone(&shared));
-
-    // WMI process monitors
-    let (wmi_tx, wmi_rx) = mpsc::channel();
-    crate::wmi_monitor::spawn_monitors(wmi_tx, Arc::clone(&shared));
-
-    // WMI forwarder: wraps ProcessEvents into AppEvents
-    { let tx = event_tx.clone();
-      std::thread::Builder::new().name("wmi-fwd".into()).spawn(move || {
-          while let Ok(ev) = wmi_rx.recv() { let _ = tx.send(AppEvent::Process(ev)); }
-      }).expect("wmi-fwd"); }
-
-    // Tray left-click: toggle window visibility
-    { std::thread::Builder::new().name("tray-fwd".into()).spawn(move || {
-          loop { match TrayIconEvent::receiver().recv() {
-              Ok(TrayIconEvent::Click { button: tray_icon::MouseButton::Left, .. }) => unsafe {
-                  let _ = PostMessageW(HWND(hwnd_val as *mut _), WM_HDR, WPARAM(HDR_TOGGLE_VIS), LPARAM(0));
-              },
-              Ok(_) => {}, Err(_) => break,
-          }}
-      }).expect("tray-fwd"); }
-
-    // Menu forwarder: pushes MenuId to queue then wakes WndProc
-    { let mq = Arc::clone(&menu_queue);
-      std::thread::Builder::new().name("menu-fwd".into()).spawn(move || {
-          while let Ok(ev) = MenuEvent::receiver().recv() {
-              mq.lock().unwrap().push_back(ev.id);
-              unsafe { let _ = PostMessageW(HWND(hwnd_val as *mut _), WM_HDR, WPARAM(HDR_MENU), LPARAM(0)); }
-          }
-      }).expect("menu-fwd"); }
-
-    // Standard Win32 message loop — blocks on GetMessageW, wakes only on real events.
-    let mut msg = MSG::default();
     unsafe {
-        while GetMessageW(&mut msg, HWND(std::ptr::null_mut()), 0, 0).as_bool() {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+        // One copy only: a second launch shows the first one's window and leaves.
+        let _instance = CreateMutexW(None, false, w!("Local\\HDRify"));
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            if let Ok(first) = FindWindowW(w!("HdrifyWnd"), None) {
+                let _ = AllowSetForegroundWindow(ASFW_ANY);
+                let _ = PostMessageW(first, WM_SHOW, WPARAM(0), LPARAM(0));
+            }
+            return;
+        }
+
+        force_dark_mode();
+        let (config, config_problem) = Config::load();
+        let app: &'static App = Box::leak(Box::new(App {
+            hwnd: Cell::default(),
+            picker: Cell::default(),
+            config: RefCell::new(config),
+            saved: RefCell::new(None),
+            hdr_on: Cell::new(false),
+            tray_added: Cell::new(false),
+            processes: RefCell::default(),
+            fonts: Cell::default(),
+            icons: [make_icon([112, 118, 128]), make_icon([24, 100, 230])],
+            bg: CreateSolidBrush(BG),
+            field: CreateSolidBrush(FIELD),
+            taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
+        }));
+
+        let instance: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
+        let procs: [(PCWSTR, WNDPROC); 2] =
+            [(w!("HdrifyWnd"), Some(wnd_proc)), (w!("HdrifyPicker"), Some(picker_proc))];
+        for (name, proc) in procs {
+            RegisterClassExW(&WNDCLASSEXW {
+                cbSize: size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: proc,
+                hInstance: instance,
+                hIcon: app.icons[1],
+                hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+                hbrBackground: app.bg,
+                lpszClassName: name,
+                ..Default::default()
+            });
+        }
+        let created = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("HdrifyWnd"),
+            w!("HDRify"),
+            MAIN_STYLE,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            0,
+            0,
+            None,
+            None,
+            instance,
+            Some(app as *const App as *const _),
+        );
+        let Ok(hwnd) = created else {
+            log::write("[!] HDRify could not create its window");
+            return;
+        };
+
+        app.log(&format!("HDRify {} started", env!("CARGO_PKG_VERSION")));
+        if let Some(problem) = config_problem {
+            app.log(&format!("[!] {problem}"));
+        }
+        watch::set_watch(app.game_names());
+        watch::spawn(hwnd);
+
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+            // IsDialogMessage gives both windows Tab, arrow keys, Enter and Esc.
+            if !IsDialogMessageW(GetAncestor(msg.hwnd, GA_ROOT), &msg).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
         }
     }
 }
