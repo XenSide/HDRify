@@ -43,6 +43,7 @@ const ID_LABEL: i32 = -1; // static text nobody looks up
 
 const TIMER_RESTORE: usize = 1;
 const TIMER_TRAY: usize = 2;
+const TIMER_WATCH: usize = 3;
 
 /// Wait this long after the last game exits before putting HDR back. A game that restarts
 /// itself (through its launcher or Steam) then costs one mode switch, not three.
@@ -116,11 +117,16 @@ struct App {
     hwnd: Cell<HWND>,
     picker: Cell<HWND>,
     config: RefCell<Config>,
-    /// Display states from before the first watched game started. `Some` from then until
-    /// the restore runs, so it also means "HDR is currently ours to put back".
+    /// The HDR displays HDRify has switched on for the running games, in the state they
+    /// had before. `Some` from the first one until the restore runs, so it also means
+    /// "HDR is currently ours to put back".
     saved: RefCell<Option<Vec<hdr::Display>>>,
     hdr_on: Cell<bool>,
-    tray_added: Cell<bool>,
+    /// The last restore could not reach every display in `saved` (one was off, or
+    /// refused); it is tried again whenever the displays change.
+    restore_owed: Cell<bool>,
+    /// The trace session has been up since the last start; decides whether to restart it.
+    watching: Cell<bool>,
     /// Exe names offered by the picker, before filtering.
     processes: RefCell<Vec<String>>,
     fonts: Cell<[HFONT; 3]>,
@@ -137,13 +143,26 @@ impl App {
         GetDlgItem(self.hwnd.get(), id).unwrap_or_default()
     }
 
+    /// Enables or disables a control. Disabling the control that has the focus would
+    /// leave the keyboard with nowhere to go, so the focus moves to the games list first.
+    unsafe fn enable(&self, id: i32, on: bool) {
+        let control = self.item(id);
+        if !on && GetFocus() == control {
+            let _ = SetFocus(self.item(ID_GAMES));
+        }
+        let _ = EnableWindow(control, on);
+    }
+
     unsafe fn log(&self, msg: &str) {
         let line = HSTRING::from(log::write(msg));
         let list = self.item(ID_LOG);
-        let count = SendMessageW(list, LB_ADDSTRING, WPARAM(0), LPARAM(line.as_ptr() as isize)).0 + 1;
+        SendMessageW(list, LB_ADDSTRING, WPARAM(0), LPARAM(line.as_ptr() as isize));
+        let mut count = SendMessageW(list, LB_GETCOUNT, WPARAM(0), LPARAM(0)).0;
         if count as usize > LOG_LINES {
             SendMessageW(list, LB_DELETESTRING, WPARAM(0), LPARAM(0));
+            count -= 1;
         }
+        // Scroll to the newest line. The index must exist or the list box ignores it.
         SendMessageW(list, LB_SETTOPINDEX, WPARAM(count.max(1) as usize - 1), LPARAM(0));
     }
 
@@ -173,7 +192,7 @@ impl App {
         }
         let _ = SetWindowTextW(self.item(ID_STATUS), &HSTRING::from(&status));
         let _ = SetWindowTextW(self.item(ID_TOGGLE), if on { w!("Turn HDR off") } else { w!("Turn HDR on") });
-        let _ = EnableWindow(self.item(ID_TOGGLE), capable);
+        self.enable(ID_TOGGLE, capable);
         self.tray(&format!("HDRify \u{2014} {status}"));
     }
 
@@ -183,17 +202,25 @@ impl App {
         let hwnd = self.hwnd.get();
         if watch::running() > 0 {
             let _ = KillTimer(hwnd, TIMER_RESTORE);
-            if self.saved.borrow().is_none() {
-                let before = hdr::query();
-                let changed = hdr::set_all(&before, true);
+            // Every HDR display gets one try: all of them when the first game starts, and
+            // any that is connected or switched on later (the TV, say) when WM_DISPLAYCHANGE
+            // brings us back here. With none there is nothing to switch or to put back.
+            let known = self.saved.borrow().clone().unwrap_or_default();
+            let (new, switch) = hdr::wanted(&known, &hdr::query(), self.restore_owed.replace(false));
+            // Recorded before switching, so the WM_DISPLAYCHANGE the switch causes finds
+            // these displays already known.
+            if !new.is_empty() {
+                self.saved.borrow_mut().get_or_insert_with(Vec::new).extend(new);
+            }
+            if !switch.is_empty() {
+                let changed = hdr::set_all(&switch, true);
                 self.log(&if changed > 0 {
                     format!("HDR turned on ({changed} display{})", if changed == 1 { "" } else { "s" })
-                } else if before.iter().any(|d| d.enabled) {
+                } else if switch.iter().all(|d| d.enabled) {
                     "HDR was already on".into()
                 } else {
-                    "[!] Could not turn HDR on: no display accepted it".into()
+                    "[!] Could not turn HDR on: the display did not accept it".into()
                 });
-                *self.saved.borrow_mut() = Some(before);
             }
         } else if self.saved.borrow().is_some() {
             SetTimer(hwnd, TIMER_RESTORE, RESTORE_DELAY_MS, None);
@@ -210,11 +237,28 @@ impl App {
         let saved = self.saved.borrow_mut().take();
         if let Some(saved) = saved {
             if !self.config.borrow().restore_on_exit {
+                self.restore_owed.set(false);
                 self.log("Left HDR as it is (restore is switched off)");
-            } else if hdr::restore(&saved) > 0 {
-                self.log("HDR put back the way it was before the game");
             } else {
-                self.log("HDR is already the way it was before the game");
+                let (changed, owed) = hdr::restore(&saved);
+                let was_owed = self.restore_owed.replace(!owed.is_empty());
+                if changed > 0 {
+                    self.log("HDR put back the way it was before the game");
+                } else if owed.is_empty() && !was_owed {
+                    self.log("HDR is already the way it was before the game");
+                }
+                if !owed.is_empty() {
+                    // Kept, so sync_hdr starts the timer again at the next display change,
+                    // which is when a display that was off comes back. Said once.
+                    if !was_owed {
+                        let n = owed.len();
+                        self.log(&format!(
+                            "[!] Could not put HDR back on {n} display{} (off, or it refused); trying again when the displays change",
+                            if n == 1 { "" } else { "s" }
+                        ));
+                    }
+                    *self.saved.borrow_mut() = Some(owed);
+                }
             }
         }
         self.refresh();
@@ -243,8 +287,7 @@ impl App {
             let mut config = self.config.borrow_mut();
             let found = config.games.iter().position(|g| g.exe_name.eq_ignore_ascii_case(exe));
             found.unwrap_or_else(|| {
-                let display_name = exe.strip_suffix(".exe").unwrap_or(exe).to_string();
-                config.games.push(GameEntry { display_name, exe_name: exe.to_string() });
+                config.games.push(GameEntry { exe_name: exe.to_string() });
                 config.games.len() - 1
             })
         };
@@ -272,7 +315,7 @@ impl App {
     }
 
     unsafe fn save(&self) {
-        let result = self.config.borrow().save();
+        let result = self.config.borrow().save(&crate::config::dir());
         if let Err(e) = result {
             self.log(&format!("[!] Could not save settings: {e}"));
         }
@@ -287,7 +330,7 @@ impl App {
         if let Some(index) = select {
             SendMessageW(list, LB_SETCURSEL, WPARAM(index), LPARAM(0));
         }
-        let _ = EnableWindow(self.item(ID_REMOVE), select.is_some());
+        self.enable(ID_REMOVE, select.is_some());
     }
 
     // ── Tray ──────────────────────────────────────────────────────────────
@@ -308,12 +351,13 @@ impl App {
         data
     }
 
-    /// Adds or updates the tray icon. Adding fails while the taskbar doesn't exist (HDRify
-    /// starts at logon, often before Explorer), so a timer retries until it works.
+    /// Updates the tray icon, adding it if it isn't there: at the first call, and after
+    /// Explorer restarted. Whether it is there is never remembered, because adding an icon
+    /// that exists fails just like adding one while there is no taskbar. That last case is
+    /// normal at logon (HDRify often starts before Explorer), so a timer retries.
     unsafe fn tray(&self, tip: &str) {
-        let action = if self.tray_added.get() { NIM_MODIFY } else { NIM_ADD };
-        let ok = Shell_NotifyIconW(action, &self.tray_data(tip)).as_bool();
-        self.tray_added.set(ok);
+        let data = self.tray_data(tip);
+        let ok = Shell_NotifyIconW(NIM_MODIFY, &data).as_bool() || Shell_NotifyIconW(NIM_ADD, &data).as_bool();
         if ok {
             let _ = KillTimer(self.hwnd.get(), TIMER_TRAY);
         } else {
@@ -340,6 +384,9 @@ impl App {
         let _ = DestroyMenu(menu);
         if chosen.0 != 0 {
             self.command(chosen.0, BN_CLICKED);
+        } else {
+            // Dismissed: keyboard focus goes back to the tray, where it came from.
+            let _ = Shell_NotifyIconW(NIM_SETFOCUS, &self.tray_data(""));
         }
     }
 
@@ -353,6 +400,12 @@ impl App {
             let _ = SetFocus(self.item(ID_GAMES)); // somewhere for the keyboard to start
         }
         self.refresh();
+    }
+
+    /// Back to the tray. The picker goes too: Windows would leave it on screen alone.
+    unsafe fn hide(&self) {
+        let _ = DestroyWindow(self.picker.get());
+        let _ = ShowWindow(self.hwnd.get(), SW_HIDE);
     }
 
     unsafe fn command(&self, id: i32, code: u32) {
@@ -373,22 +426,23 @@ impl App {
             }
             (ID_REMOVE, BN_CLICKED) => self.remove_selected_game(),
             (ID_GAMES, LBN_SELCHANGE) => {
-                let _ = EnableWindow(self.item(ID_REMOVE), true);
+                self.enable(ID_REMOVE, true);
             }
             (ID_OPEN, BN_CLICKED) => self.show(),
             (ID_EXIT, BN_CLICKED) => {
                 self.shut_down();
                 let _ = DestroyWindow(hwnd);
             }
-            (ID_CANCEL, BN_CLICKED) => {
-                let _ = ShowWindow(hwnd, SW_HIDE);
-            }
+            (ID_CANCEL, BN_CLICKED) => self.hide(),
             _ => {}
         }
     }
 
     /// Exit, logoff or shutdown: give HDR back now, there is no later.
     unsafe fn shut_down(&self) {
+        // Forget the games first. Putting HDR back sends WM_DISPLAYCHANGE, and with a game
+        // still counted as running that would switch HDR straight back on.
+        watch::set_watch(vec![]);
         let saved = self.saved.borrow_mut().take();
         if let Some(saved) = saved {
             if self.config.borrow().restore_on_exit {
@@ -573,9 +627,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         }
         WM_COMMAND => app.command((wp.0 & 0xFFFF) as i32, (wp.0 >> 16) as u32 & 0xFFFF),
         WM_TRAY => match lp.0 as u32 {
-            WM_LBUTTONUP if IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() => {
-                let _ = ShowWindow(hwnd, SW_HIDE);
-            }
+            // Always show, never toggle: a double-click sends two of these.
             WM_LBUTTONUP => app.show(),
             WM_RBUTTONUP => app.tray_menu(),
             _ => {}
@@ -586,19 +638,34 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 watch::STARTED => app.log(&format!("{text} started")),
                 watch::STOPPED => app.log(&format!("{text} exited")),
                 watch::READY => {
+                    app.watching.set(true);
                     for name in watch::set_watch(app.game_names()) {
                         app.log(&format!("{name} is already running"));
                     }
                 }
-                _ => app.log(&format!("[!] {text}")),
+                _ => {
+                    app.log(&format!("[!] {text}"));
+                    // A session that was up and got ended by something else is started
+                    // again. One that never came up (no administrator rights) is not.
+                    if app.watching.replace(false) {
+                        // Sooner than the restore delay, so a running game is found
+                        // again before HDR would be put back.
+                        SetTimer(hwnd, TIMER_WATCH, 1000, None);
+                    }
+                }
             }
             app.sync_hdr();
         }
         WM_SHOW => app.show(),
         WM_TIMER if wp.0 == TIMER_RESTORE => app.restore(),
         WM_TIMER if wp.0 == TIMER_TRAY => app.refresh(),
+        WM_TIMER if wp.0 == TIMER_WATCH => {
+            let _ = KillTimer(hwnd, TIMER_WATCH);
+            app.log("Watching for games again");
+            watch::spawn(hwnd);
+        }
         // HDR was switched by us, by Win+Alt+B or in Settings, or a monitor came or went.
-        WM_DISPLAYCHANGE => app.refresh(),
+        WM_DISPLAYCHANGE => app.sync_hdr(),
         WM_DPICHANGED => {
             // shortcut: an open picker keeps its old size, it is closed instead; re-lay it out if that annoys.
             let _ = DestroyWindow(app.picker.get());
@@ -615,15 +682,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         }
         WM_VKEYTOITEM => return LRESULT(-1),
         // The close button only hides the window; Exit is in the tray menu.
-        WM_CLOSE => {
-            let _ = ShowWindow(hwnd, SW_HIDE);
+        WM_CLOSE => app.hide(),
+        // Logoff and shutdown, and also an installer asking the app to close: exit either way.
+        WM_ENDSESSION if wp.0 != 0 => {
+            app.shut_down();
+            let _ = DestroyWindow(hwnd);
         }
-        WM_ENDSESSION if wp.0 != 0 => app.shut_down(),
         WM_DESTROY => PostQuitMessage(0),
-        _ if msg == app.taskbar_created => {
-            app.tray_added.set(false);
-            app.refresh();
-        }
+        _ if msg == app.taskbar_created => app.refresh(),
         _ => return DefWindowProcW(hwnd, msg, wp, lp),
     }
     LRESULT(0)
@@ -655,6 +721,10 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             _ => {}
         },
         WM_CTLCOLORSTATIC | WM_CTLCOLORBTN | WM_CTLCOLORLISTBOX | WM_CTLCOLOREDIT => return app.colors(msg, wp, lp),
+        // shortcut: on a monitor with another scale the picker closes instead of resizing; re-lay it out if that annoys.
+        WM_DPICHANGED => {
+            let _ = DestroyWindow(hwnd);
+        }
         WM_DESTROY => app.picker.set(HWND::default()),
         _ => return DefWindowProcW(hwnd, msg, wp, lp),
     }
@@ -733,8 +803,9 @@ unsafe fn force_dark_mode() {
 pub fn run() {
     unsafe {
         // One copy only: a second launch shows the first one's window and leaves.
-        let _instance = CreateMutexW(None, false, w!("Local\\HDRify"));
-        if GetLastError() == ERROR_ALREADY_EXISTS {
+        // Failing with "access denied" means an elevated copy owns it and this one isn't.
+        let instance = CreateMutexW(None, false, w!("Local\\HDRify"));
+        if instance.is_err() || GetLastError() == ERROR_ALREADY_EXISTS {
             if let Ok(first) = FindWindowW(w!("HdrifyWnd"), None) {
                 let _ = AllowSetForegroundWindow(ASFW_ANY);
                 let _ = PostMessageW(first, WM_SHOW, WPARAM(0), LPARAM(0));
@@ -743,14 +814,15 @@ pub fn run() {
         }
 
         force_dark_mode();
-        let (config, config_problem) = Config::load();
+        let (config, config_problem) = Config::load(&crate::config::dir());
         let app: &'static App = Box::leak(Box::new(App {
             hwnd: Cell::default(),
             picker: Cell::default(),
             config: RefCell::new(config),
             saved: RefCell::new(None),
             hdr_on: Cell::new(false),
-            tray_added: Cell::new(false),
+            restore_owed: Cell::new(false),
+            watching: Cell::new(false),
             processes: RefCell::default(),
             fonts: Cell::default(),
             icons: [make_icon([112, 118, 128]), make_icon([24, 100, 230])],
@@ -792,6 +864,10 @@ pub fn run() {
             log::write("[!] HDRify could not create its window");
             return;
         };
+
+        // Explorer is not elevated and the release build is; let its "the taskbar is back"
+        // broadcast through whatever the message filter's default is.
+        let _ = ChangeWindowMessageFilterEx(hwnd, app.taskbar_created, MSGFLT_ALLOW, None);
 
         app.log(&format!("HDRify {} started", env!("CARGO_PKG_VERSION")));
         if let Some(problem) = config_problem {

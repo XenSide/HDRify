@@ -10,7 +10,7 @@ use crate::app::WM_WATCH;
 use std::mem::{size_of, zeroed};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Mutex, MutexGuard};
-use windows::core::{w, GUID, PCWSTR, PWSTR};
+use windows::core::{w, GUID, HSTRING, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_INVALID_PARAMETER, ERROR_SUCCESS, HWND,
     LPARAM, WPARAM,
@@ -19,6 +19,8 @@ use windows::Win32::System::Diagnostics::Etw::*;
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
+use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 // `wParam` of WM_WATCH. `lParam` is a `Box<String>`: the game's exe name, or the error text.
@@ -40,7 +42,7 @@ impl Tracker {
     /// A process started. `image` is its exe name or full path. Returns the watch-list
     /// name if it is a watched game that isn't tracked yet.
     fn started(&mut self, pid: u32, image: &str) -> Option<String> {
-        let exe = image.rsplit(['\\', '/']).next()?;
+        let exe = image.rsplit(['\\', '/']).next().filter(|exe| !exe.is_empty())?;
         let name = self.watch.iter().find(|w| w.eq_ignore_ascii_case(exe))?.clone();
         if self.running.iter().any(|(p, _)| *p == pid) {
             return None;
@@ -87,8 +89,9 @@ pub fn set_watch(names: Vec<String>) -> Vec<String> {
     if !is_tracing() {
         return vec![];
     }
-    // The snapshot is taken under the lock, so the exit event of any process in it is
-    // handled after the process is tracked, never before.
+    // The snapshot is taken under the lock, so an exit event that arrives from now on is
+    // handled after its process is tracked.
+    // shortcut: a game whose exit event was already handled but that Windows still lists (it is unloading) stays tracked, check tracked pids against a snapshot if HDR ever sticks after editing the list while a game closes.
     processes().iter().filter_map(|(pid, exe)| t.started(*pid, exe)).collect()
 }
 
@@ -113,7 +116,13 @@ pub fn processes() -> Vec<(u32, String)> {
 
 // ── ETW session ───────────────────────────────────────────────────────────
 
-const SESSION: PCWSTR = w!("HDRify");
+/// The session name. Sessions are machine-wide, so each Windows logon session gets its
+/// own: two signed-in users running HDRify don't stop each other's.
+fn session_name() -> HSTRING {
+    let mut id = 0;
+    let _ = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut id) };
+    HSTRING::from(format!("HDRify-{id}"))
+}
 /// Microsoft-Windows-Kernel-Process
 const PROVIDER: GUID = GUID::from_u128(0x22fb2cd6_0e7b_422b_a0c7_2fad1fd0e716);
 /// WINEVENT_KEYWORD_PROCESS: process start and stop only, no thread or image-load events.
@@ -130,15 +139,16 @@ const FLUSH_MS: u32 = 50;
 #[repr(C)]
 struct Session {
     properties: EVENT_TRACE_PROPERTIES,
-    name: [u16; 16], // StartTrace copies the session name here
+    name: [u16; 32], // StartTrace copies the session name here
 }
 
 fn session(ms_flush: bool) -> Session {
     let mut s: Session = unsafe { zeroed() };
     s.properties.Wnode.BufferSize = size_of::<Session>() as u32;
     s.properties.Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-    s.properties.Wnode.ClientContext = 1; // QPC timestamps
-                                          // One shared buffer keeps a start and its stop in order; fine at this event rate.
+    // QPC timestamps.
+    s.properties.Wnode.ClientContext = 1;
+    // One shared buffer keeps a start and its stop in order; fine at this event rate.
     s.properties.LogFileMode = EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_NO_PER_PROCESSOR_BUFFERING;
     s.properties.FlushTimer = 1;
     if ms_flush {
@@ -156,6 +166,8 @@ pub fn spawn(hwnd: HWND) {
     std::thread::spawn(move || unsafe {
         if let Some(error) = trace(hwnd) {
             TRACING.store(false, Relaxed);
+            // No exit events will come for these any more; they must not hold HDR on.
+            tracker().running.clear();
             post(hwnd, FAILED, error);
         }
     });
@@ -165,23 +177,29 @@ pub fn spawn(hwnd: HWND) {
 /// outlives its process, so this must run on exit.
 pub fn stop() {
     TRACING.store(false, Relaxed);
+    stop_session(&session_name());
+}
+
+fn stop_session(name: &HSTRING) {
     let mut s = session(false);
     unsafe {
-        let _ = ControlTraceW(CONTROLTRACE_HANDLE::default(), SESSION, &mut s.properties, EVENT_TRACE_CONTROL_STOP);
+        let _ = ControlTraceW(CONTROLTRACE_HANDLE::default(), name, &mut s.properties, EVENT_TRACE_CONTROL_STOP);
     }
 }
 
 /// Runs the session until it ends. Returns the reason, or None if `stop()` ended it.
 unsafe fn trace(hwnd: isize) -> Option<String> {
+    let name = session_name();
     stop(); // left behind if HDRify was killed last time
+    stop_session(&HSTRING::from("HDRify")); // the name 0.2.0 used
 
     let mut s = session(true);
     let mut handle = CONTROLTRACE_HANDLE::default();
-    let mut e = StartTraceW(&mut handle, SESSION, &mut s.properties);
+    let mut e = StartTraceW(&mut handle, &name, &mut s.properties);
     if e == ERROR_INVALID_PARAMETER {
         // A Windows that doesn't know the millisecond flag: settle for the 1 s timer.
         s = session(false);
-        e = StartTraceW(&mut handle, SESSION, &mut s.properties);
+        e = StartTraceW(&mut handle, &name, &mut s.properties);
     }
     // "Already exists" right after stop() means the old session couldn't be stopped either.
     if e == ERROR_ACCESS_DENIED || e == ERROR_ALREADY_EXISTS {
@@ -206,12 +224,13 @@ unsafe fn trace(hwnd: isize) -> Option<String> {
     }
 
     let mut log: EVENT_TRACE_LOGFILEW = zeroed();
-    log.LoggerName = PWSTR(SESSION.as_ptr() as *mut u16);
+    log.LoggerName = PWSTR(name.as_ptr() as *mut u16);
     log.Anonymous1.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
     log.Anonymous2.EventRecordCallback = Some(on_event);
     log.Context = hwnd as *mut _;
     let consumer = OpenTraceW(&mut log);
-    if consumer.Value == u64::MAX {
+    // INVALID_PROCESSTRACE_HANDLE is a pointer-sized -1.
+    if consumer.Value as usize == usize::MAX {
         let e = GetLastError();
         stop();
         return Some(format!("Can't watch for games: OpenTrace failed (error {}).", e.0));
@@ -288,6 +307,7 @@ mod tests {
         assert_eq!(t.started(2, "game.exe").as_deref(), Some("Game.exe"));
         assert_eq!(t.started(3, r"C:\x\notgame.exe"), None);
         assert_eq!(t.started(4, ""), None);
+        assert_eq!(tracker(&[""]).started(5, ""), None);
         assert_eq!(t.running.len(), 2);
     }
 
